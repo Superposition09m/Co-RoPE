@@ -4,6 +4,97 @@ import math
 
 from utils import print_red_warning, calc_sim, assert_similar
 
+class CoRoPEAttention(torch.autograd.Function):
+    """
+    CoRoPE Attention Function with manual backward pass
+    当前实现：Plain Attention（后续会加 RoPE）
+    """
+    @staticmethod
+    def forward(ctx, q, k, v, scale_factor, causal_mask):
+        """
+        Args:
+            q: (B, n_head, T, head_dim)
+            k: (B, n_head, T, head_dim)
+            v: (B, n_head, T, head_dim)
+            scale_factor: float
+            causal_mask: (1, 1, T, T) or None
+        Returns:
+            output: (B, n_head, T, head_dim)
+        """
+        # Compute attention scores: Q @ K^T * scale_factor
+        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k) * scale_factor
+        
+        # Apply causal mask if needed
+        if causal_mask is not None:
+            attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+        
+        # Softmax to get attention weights
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        
+        # Apply mask to weights (set masked positions to 0)
+        if causal_mask is not None:
+            attn_weights = attn_weights.masked_fill(causal_mask, 0.0)
+        
+        # Attention output: attn_weights @ V
+        output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+        
+        # Save for backward
+        ctx.save_for_backward(q, k, v, attn_weights)
+        ctx.scale_factor = scale_factor
+        ctx.causal_mask = causal_mask
+        
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Args:
+            grad_output: (B, n_head, T, head_dim) - gradient w.r.t. output
+        Returns:
+            dq, dk, dv: (B, n_head, T, head_dim)
+            dscale_factor: None
+            dcausal_mask: None
+        """
+        q, k, v, attn_weights = ctx.saved_tensors
+        scale_factor = ctx.scale_factor
+        causal_mask = ctx.causal_mask
+        
+        # Step 1: dV = attn_weights^T @ grad_output
+        # attn_weights: (B, H, Q, K)
+        # grad_output: (B, H, Q, D)
+        # dv: (B, H, K, D)
+        dv = torch.einsum('bhqk,bhqd->bhkd', attn_weights, grad_output)
+        
+        # Step 2: dS = grad_output @ V^T (gradient w.r.t. attn_weights)
+        # grad_output: (B, H, Q, D)
+        # v: (B, H, K, D)
+        # ds: (B, H, Q, K)
+        ds = torch.einsum('bhqd,bhkd->bhqk', grad_output, v)
+        
+        # Step 3: Softmax backward
+        # Softmax backward formula: dp[i] = s[i] * (ds[i] - sum_j(s[j] * ds[j]))
+        # where s = attn_weights, ds = gradient w.r.t. attn_weights
+        d_softmax_sum = torch.sum(ds * attn_weights, dim=-1, keepdim=True)  # (B, H, Q, 1)
+        dp = attn_weights * (ds - d_softmax_sum)  # (B, H, Q, K)
+        
+        # Apply mask to dp (gradient w.r.t. attn_scores)
+        if causal_mask is not None:
+            dp = dp.masked_fill(causal_mask, 0.0)
+        
+        # Step 4: dQ = dp @ K * scale_factor
+        # dp: (B, H, Q, K)
+        # k: (B, H, K, D)
+        # dq: (B, H, Q, D)
+        dq = torch.einsum('bhqk,bhkd->bhqd', dp, k) * scale_factor
+        
+        # Step 5: dK = dp^T @ Q * scale_factor
+        # dp: (B, H, Q, K)
+        # q: (B, H, Q, D)
+        # dk: (B, H, K, D)
+        dk = torch.einsum('bhqk,bhqd->bhkd', dp, q) * scale_factor
+        
+        return dq, dk, dv, None, None
+
 class CoRoPE(torch.nn.Module):
     """
     Co-RoPE Attention Block:
@@ -57,23 +148,14 @@ class CoRoPE(torch.nn.Module):
             k = k.repeat_interleave(num_groups, dim=1)  # (B, n_head, T, head_dim)
             v = v.repeat_interleave(num_groups, dim=1)  # (B, n_head, T, head_dim)
 
-        # Compute attention scores
-        # q: (B, n_head, T, head_dim)
-        # k: (B, n_head, T, head_dim)
-        # attn_scores: (B, n_head, T, T), the last two dim [q, k]
-        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)
-        attn_scores = attn_scores * self.scale_factor
+        # Create causal mask if needed
+        causal_mask = None
         if causal:
             mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
-            mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
-            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+            causal_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
 
-        # attn_scores: (B, n_head, T, T) -> attn_weights: (B, n_head, T, T)
-        attn_weights = F.softmax(attn_scores, dim=-1)# probabilities sum to 1 for all kv pairs
-        # v: (B, n_head, T, head_dim)
-        # attn_weights: (B, n_head, T, T)
-        # y: (B, n_head, T, head_dim)
-        y = torch.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+        # Use CoRoPEAttention with manual backward
+        y = CoRoPEAttention.apply(q, k, v, self.scale_factor, causal_mask)
 
         # Reshape back: (B, n_head, T, head_dim) -> (B, T, n_head * head_dim)
         y = y.transpose(1, 2).contiguous()
@@ -147,10 +229,91 @@ def simple_test1():
 
 def simple_test2():
     """
-    Test the handwritten backward pass
+    Test the handwritten backward pass against PyTorch autograd
     """
-    # TODO: Implement backward pass test
-    pass
+    print("=" * 60)
+    print("Testing Handwritten Backward Pass")
+    print("=" * 60)
+    
+    torch.manual_seed(42)
+    B, T, n_embd = 2, 8, 64
+    n_head = 4
+    n_kv_head = 2  # Test GQA
+    
+    print(f"\nTest configuration: B={B}, T={T}, n_embd={n_embd}, n_head={n_head}, n_kv_head={n_kv_head}")
+    
+    # Test 1: Forward pass consistency
+    print("\n--- Test 1: Forward Pass Consistency ---")
+    q_test = torch.randn(B, n_head, T, n_embd // n_head, requires_grad=True, dtype=torch.float64)
+    k_test = torch.randn(B, n_head, T, n_embd // n_head, requires_grad=True, dtype=torch.float64)
+    v_test = torch.randn(B, n_head, T, n_embd // n_head, requires_grad=True, dtype=torch.float64)
+    scale_factor = 1.0 / math.sqrt(n_embd // n_head)
+    
+    # Create causal mask
+    mask = torch.triu(torch.ones(T, T, device=q_test.device, dtype=torch.bool), diagonal=1)
+    causal_mask = mask.unsqueeze(0).unsqueeze(0)
+    
+    # Reference: using PyTorch autograd (manual computation)
+    attn_scores_ref = torch.einsum('bhqd,bhkd->bhqk', q_test, k_test) * scale_factor
+    attn_scores_ref = attn_scores_ref.masked_fill(causal_mask, float('-inf'))
+    attn_weights_ref = F.softmax(attn_scores_ref, dim=-1)
+    attn_weights_ref = attn_weights_ref.masked_fill(causal_mask, 0.0)
+    output_ref = torch.einsum('bhqk,bhkd->bhqd', attn_weights_ref, v_test)
+    
+    # Our manual forward (using CoRoPEAttention)
+    q_manual = q_test.detach().clone().requires_grad_(True)
+    k_manual = k_test.detach().clone().requires_grad_(True)
+    v_manual = v_test.detach().clone().requires_grad_(True)
+    output_manual = CoRoPEAttention.apply(q_manual, k_manual, v_manual, scale_factor, causal_mask)
+    
+    # Check forward
+    assert_similar(output_ref, output_manual, eps=1e-8, name="forward output")
+    
+    # Test 2: Backward pass consistency
+    print("\n--- Test 2: Backward Pass Consistency ---")
+    grad_output = torch.randn_like(output_ref)
+    
+    # Reference backward
+    output_ref.backward(grad_output)
+    dq_ref = q_test.grad.clone()
+    dk_ref = k_test.grad.clone()
+    dv_ref = v_test.grad.clone()
+    
+    # Manual backward
+    output_manual.backward(grad_output)
+    dq_manual = q_manual.grad.clone()
+    dk_manual = k_manual.grad.clone()
+    dv_manual = v_manual.grad.clone()
+    
+    # Check backward
+    assert_similar(dq_ref, dq_manual, eps=1e-6, name="dq")
+    assert_similar(dk_ref, dk_manual, eps=1e-6, name="dk")
+    assert_similar(dv_ref, dv_manual, eps=1e-6, name="dv")
+    
+    # Test 3: Full model backward (including Linear layers)
+    print("\n--- Test 3: Full Model Backward Pass ---")
+    model = CoRoPE(n_embd=n_embd, n_head=n_head, n_kv_head=n_kv_head).double()
+    x = torch.randn(B, T, n_embd, dtype=torch.float64, requires_grad=True)
+    
+    output = model(x, causal=True)
+    loss = (output * torch.randn_like(output)).sum()
+    loss.backward()
+    
+    # Check all gradients are finite
+    assert x.grad is not None, "Input gradient is None!"
+    assert torch.isfinite(x.grad).all(), "Input gradient contains NaN or Inf!"
+    print("✓ Input gradient is finite")
+    
+    for name, param in model.named_parameters():
+        assert param.grad is not None, f"Gradient for {name} is None!"
+        assert torch.isfinite(param.grad).all(), f"Gradient for {name} contains NaN or Inf!"
+    print("✓ All parameter gradients are finite")
+    
+    print("\n" + "=" * 60)
+    print("All backward pass tests PASSED! ✓")
+    print("=" * 60)
 
 if __name__ == "__main__":
     simple_test1()
+    print("\n")
+    simple_test2()
