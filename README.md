@@ -30,3 +30,11 @@ pip install flash-attn --no-build-isolation
 ## Adopted `flash_attn_v2_triton.py` and `attn_pytorch.py`
 
 ## Next Step: Implement RoPE to both torch and triton
+
+rope in torch:
+
+seq_len=512 + theta=500000 ERR 4.5e-05
+
+seems done.
+
+now start to implement rope in triton.
