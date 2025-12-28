@@ -26,7 +26,8 @@ class _attention_pytorch(torch.autograd.Function):
             output: (BATCH, H, N_CTX, HEAD_DIM)
         """
         # Compute attention scores: Q @ K^T * sm_scale
-        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k) * sm_scale
+        # Use fp32 for dot product accumulation to avoid precision loss in long sequences
+        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q.to(torch.float32), k.to(torch.float32)) * sm_scale
         
         # Apply causal mask if needed
         if causal:
@@ -35,15 +36,40 @@ class _attention_pytorch(torch.autograd.Function):
             causal_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, N_CTX, N_CTX)
             attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
         
-        # Softmax to get attention weights
-        attn_weights = F.softmax(attn_scores, dim=-1)
+        # Safe Softmax: manually implement to ensure fp32 precision
+        # Step 1: Find row-wise maximum for numerical stability
+        attn_scores_max = torch.max(attn_scores, dim=-1, keepdim=True).values
+        # Handle -inf case (all masked) to avoid NaN in subtraction
+        if causal:
+            attn_scores_max = torch.where(
+                torch.isinf(attn_scores_max), 
+                torch.zeros_like(attn_scores_max), 
+                attn_scores_max
+            )
+        
+        # Step 2: Subtract max (safe softmax trick)
+        attn_scores_shifted = attn_scores - attn_scores_max
+        
+        # Step 3: Exponentiate (all in fp32)
+        attn_scores_exp = torch.exp(attn_scores_shifted)
+        
+        # Step 4: Apply mask to exp scores (set masked positions to 0)
+        if causal:
+            attn_scores_exp = attn_scores_exp.masked_fill(causal_mask, 0.0)
+        
+        # Step 5: Sum exponentials (in fp32 to avoid overflow)
+        attn_scores_sum = torch.sum(attn_scores_exp, dim=-1, keepdim=True)
+        
+        # Step 6: Normalize to get attention weights
+        attn_weights = attn_scores_exp / attn_scores_sum
         
         # Apply mask to weights (set masked positions to 0)
         if causal:
             attn_weights = attn_weights.masked_fill(causal_mask, 0.0)
         
         # Attention output: attn_weights @ V
-        output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+        # Use fp32 for weighted sum accumulation to avoid precision loss in long sequences
+        output = torch.einsum('bhqk,bhkd->bhqd', attn_weights.to(torch.float32), v.to(torch.float32)).to(q.dtype)
         
         # Save for backward
         ctx.save_for_backward(q, k, v, attn_weights)
@@ -74,24 +100,37 @@ class _attention_pytorch(torch.autograd.Function):
             causal_mask = mask.unsqueeze(0).unsqueeze(0)
         
         # Step 1: dV = attn_weights^T @ grad_output
-        dv = torch.einsum('bhqk,bhqd->bhkd', attn_weights, grad_output)
+        # Use fp32 for matrix multiplication accumulation
+        dv = torch.einsum('bhqk,bhqd->bhkd', attn_weights.to(torch.float32), grad_output.to(torch.float32)).to(grad_output.dtype)
         
         # Step 2: dS = grad_output @ V^T (gradient w.r.t. attn_weights)
-        ds = torch.einsum('bhqd,bhkd->bhqk', grad_output, v)
+        # Use fp32 for matrix multiplication accumulation
+        ds = torch.einsum('bhqd,bhkd->bhqk', grad_output.to(torch.float32), v.to(torch.float32))
         
         # Step 3: Softmax backward
-        d_softmax_sum = torch.sum(ds * attn_weights, dim=-1, keepdim=True)
-        dp = attn_weights * (ds - d_softmax_sum)
+        # Use fp32 for accumulation to avoid precision loss in mixed precision training
+        d_softmax_sum = torch.sum(
+            ds * attn_weights.to(torch.float32), 
+            dim=-1, 
+            keepdim=True
+        )
+        dp = attn_weights.to(torch.float32) * (ds - d_softmax_sum)
         
         # Apply mask to dp (gradient w.r.t. attn_scores)
         if causal:
             dp = dp.masked_fill(causal_mask, 0.0)
         
         # Step 4: dQ = dp @ K * sm_scale
-        dq = torch.einsum('bhqk,bhkd->bhqd', dp, k) * sm_scale
-        
+        # Use fp32 for matrix multiplication accumulation
+        dq = torch.einsum('bhqk,bhkd->bhqd', dp, k.to(torch.float32)) * sm_scale
+
         # Step 5: dK = dp^T @ Q * sm_scale
-        dk = torch.einsum('bhqk,bhqd->bhkd', dp, q) * sm_scale
+        # Use fp32 for matrix multiplication accumulation
+        dk = torch.einsum('bhqk,bhqd->bhkd', dp, q.to(torch.float32)) * sm_scale
+        
+        # Convert back to original dtype
+        dq = dq.to(q.dtype)
+        dk = dk.to(k.dtype)
         
         return dq, dk, dv, None, None
 
