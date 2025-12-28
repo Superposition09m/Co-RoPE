@@ -24,12 +24,8 @@ pip install flash-attn --no-build-isolation
 
 # Coding Plan
 
-## Step 1: Implement Co-RoPE in PyTorch
+## Abandoned `co_rope_torch.py`
 
-We start from plain attention mechanism and then implement Co-RoPE in PyTorch.
+## Adopted `flash_attn_v2_triton.py` and `attn_pytorch.py`
 
-## Step 2: Implement Co-RoPE in Triton
-
-## Step 3: Benchmark the Performance
-
-## Step 4: Incorporate Co-RoPE Attention into a Transformer Model, Test the Performance
+## Next Step: Implement RoPE to both torch and triton
