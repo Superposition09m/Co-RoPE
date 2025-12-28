@@ -47,29 +47,35 @@ def is_hopper():
 @triton.jit
 def _rotate_half(x, HEAD_DIM: tl.constexpr):
     """
-    Triton implementation of rotate_half for RoPE
+    Triton implementation of rotate_half for RoPE using SPLIT layout
     Split x in half and rotate: [x1, x2] -> [-x2, x1]
+    
+    Split layout: x = [x_0, x_1, ..., x_{d/2-1}, x_{d/2}, ..., x_{d-1}]
+                  return [-x_{d/2}, ..., -x_{d-1}, x_0, ..., x_{d/2-1}]
 
     Args:
-        x: [BLOCK, HEAD_DIM] - input tensor
+        x: [BLOCK, HEAD_DIM] - input tensor (already loaded)
         HEAD_DIM: must be even
 
     Returns:
-        rotated: [BLOCK, HEAD_DIM] with layout [-x_{d/2:d}, x_{0:d/2}]
+        rotated: [BLOCK, HEAD_DIM] with split layout [-x_{d/2:d}, x_{0:d/2}]
     """
     half_dim: tl.constexpr = HEAD_DIM // 2
-
-    # Split into two halves
-    x1 = x[:, :half_dim]      # First half
-    x2 = x[:, half_dim:]      # Second half
-
-    # Concatenate: [-x2, x1]
-    # Note: Triton doesn't have direct cat, so we create output and assign
-    rotated = tl.zeros_like(x)
-    rotated[:, :half_dim] = -x2
-    rotated[:, half_dim:] = x1
-
-    return rotated
+    
+    # Reshape x to [BLOCK, 2, half_dim] where dim=0 is first half, dim=1 is second half
+    x_reshaped = x.reshape([x.shape[0], 2, half_dim])  # [BLOCK, 2, half_dim]
+    
+    # Extract first and second halves directly from the reshaped tensor
+    # Use permute and split to extract the two halves
+    x_permuted = x_reshaped.permute([0, 2, 1])  # [BLOCK, half_dim, 2]
+    x1, x2 = x_permuted.split()  # Each: [BLOCK, half_dim]
+    
+    # Apply rotation: result = [-x2, x1]
+    # Join them in the rotated order
+    rotated_joined = tl.join(-x2, x1)  # [BLOCK, half_dim, 2]
+    
+    # Permute back and reshape to [BLOCK, HEAD_DIM]
+    return rotated_joined.permute([0, 2, 1]).reshape([x.shape[0], HEAD_DIM])  # [BLOCK, HEAD_DIM]
 
 
 @triton.jit
@@ -77,6 +83,9 @@ def _compute_rope_freqs(positions, theta, HEAD_DIM: tl.constexpr):
     """
     Compute RoPE cos and sin on-the-fly in the kernel
     This is MUCH faster than loading from HBM!
+    
+    Uses SPLIT layout: [freq0, freq1, ..., freq_{d/2-1}, freq0, freq1, ..., freq_{d/2-1}]
+    This matches the mainstream RoPE implementation (HuggingFace, Flash Attention)
 
     Args:
         positions: [BLOCK] - position indices (e.g., [0, 1, 2, ..., BLOCK-1])
@@ -84,32 +93,35 @@ def _compute_rope_freqs(positions, theta, HEAD_DIM: tl.constexpr):
         HEAD_DIM: head dimension (must be even)
 
     Returns:
-        cos_vals: [BLOCK, HEAD_DIM] - cos values
-        sin_vals: [BLOCK, HEAD_DIM] - sin values
+        cos_vals: [BLOCK, HEAD_DIM] - cos values in split layout
+        sin_vals: [BLOCK, HEAD_DIM] - sin values in split layout
     """
     half_dim: tl.constexpr = HEAD_DIM // 2
 
-    # Compute dimension indices: i in [0, HEAD_DIM//2 - 1]
-    i = tl.arange(0, half_dim)
+    # Compute frequency indices for the first half: i in [0, half_dim - 1]
+    i = tl.arange(0, half_dim).to(tl.float32)
 
     # Compute frequencies: freq_i = 1.0 / (theta^(2i / HEAD_DIM))
-    freqs = 1.0 / (theta ** (2.0 * i.to(tl.float32) / HEAD_DIM))  # [half_dim]
+    exponent = 2.0 * i / HEAD_DIM  # [half_dim]
+    log_theta = tl.log(theta)
+    freqs = 1.0 / tl.exp(log_theta * exponent)  # [half_dim]
 
     # Compute angles: m * freq_i for each position m
     angles = positions[:, None].to(tl.float32) * freqs[None, :]  # [BLOCK, half_dim]
 
-    # Compute cos and sin
+    # Compute cos and sin for first half
     cos_half = tl.cos(angles)  # [BLOCK, half_dim]
     sin_half = tl.sin(angles)  # [BLOCK, half_dim]
 
-    # Expand to full HEAD_DIM using split layout: [cos, cos]
-    cos_vals = tl.zeros([positions.shape[0], HEAD_DIM], dtype=tl.float32)
-    sin_vals = tl.zeros([positions.shape[0], HEAD_DIM], dtype=tl.float32)
-
-    cos_vals[:, :half_dim] = cos_half
-    cos_vals[:, half_dim:] = cos_half
-    sin_vals[:, :half_dim] = sin_half
-    sin_vals[:, half_dim:] = sin_half
+    # Use split layout: concatenate [cos_half, cos_half] using tl.join
+    # tl.join creates [BLOCK, half_dim, 2], then permute and reshape to get split layout
+    cos_joined = tl.join(cos_half, cos_half)  # [BLOCK, half_dim, 2]
+    sin_joined = tl.join(sin_half, sin_half)  # [BLOCK, half_dim, 2]
+    
+    # Permute to [BLOCK, 2, half_dim] and reshape to [BLOCK, HEAD_DIM]
+    # This creates layout: [cos0, cos1, ..., cos_{d/2-1}, cos0, cos1, ..., cos_{d/2-1}]
+    cos_vals = cos_joined.permute([0, 2, 1]).reshape([positions.shape[0], HEAD_DIM])
+    sin_vals = sin_joined.permute([0, 2, 1]).reshape([positions.shape[0], HEAD_DIM])
 
     return cos_vals, sin_vals
 
@@ -131,6 +143,26 @@ def _apply_rope(x, positions, theta, HEAD_DIM: tl.constexpr):
     # Compute cos/sin on-the-fly (in registers!)
     cos, sin = _compute_rope_freqs(positions, theta, HEAD_DIM)
 
+    # Apply rotation
+    x_rot_half = _rotate_half(x, HEAD_DIM)
+    return x * cos + x_rot_half * sin
+
+
+@triton.jit
+def _apply_rope_with_cos_sin(x, cos, sin, HEAD_DIM: tl.constexpr):
+    """
+    Apply RoPE using precomputed cos and sin values
+    This is used in backward pass where cos/sin are already computed
+
+    Args:
+        x: [BLOCK, HEAD_DIM] - input tensor
+        cos: [BLOCK, HEAD_DIM] - precomputed cos values
+        sin: [BLOCK, HEAD_DIM] - precomputed sin values (can be negated for inverse RoPE)
+        HEAD_DIM: head dimension (must be even)
+
+    Returns:
+        x_rotated: [BLOCK, HEAD_DIM]
+    """
     # Apply rotation
     x_rot_half = _rotate_half(x, HEAD_DIM)
     return x * cos + x_rot_half * sin
@@ -557,9 +589,9 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
     # Apply inverse RoPE to dK before writing back
     # Compute freqs on-the-fly for K positions (offs_n)
-    # Inverse RoPE: compute cos/sin, then negate sin in _apply_rope
+    # Inverse RoPE: compute cos/sin, then negate sin
     cos_k, sin_k = _compute_rope_freqs(offs_n, theta, HEAD_DIM)
-    dk = _apply_rope(dk, cos_k, -sin_k, HEAD_DIM)
+    dk = _apply_rope_with_cos_sin(dk, cos_k, -sin_k, HEAD_DIM)
 
     # Write back dK.
     dk *= sm_scale
@@ -613,9 +645,9 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
     # Apply inverse RoPE to dQ before writing back
     # Compute freqs on-the-fly for Q positions (offs_m)
-    # Inverse RoPE: compute cos/sin, then negate sin in _apply_rope
+    # Inverse RoPE: compute cos/sin, then negate sin
     cos_q, sin_q = _compute_rope_freqs(offs_m, theta, HEAD_DIM)
-    dq = _apply_rope(dq, cos_q, -sin_q, HEAD_DIM)
+    dq = _apply_rope_with_cos_sin(dq, cos_q, -sin_q, HEAD_DIM)
 
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -690,7 +722,14 @@ class _attention(torch.autograd.Function):
             IS_HOPPER=is_hopper(),  #
             **extra_kern_args)
 
-        ctx.save_for_backward(q, k, v, o, M)
+        # Apply RoPE to q and k for saving (backward needs RoPE'd versions)
+        # Compute RoPE freqs and apply (matching what kernel does)
+        from rope_attn_pytorch import precompute_freqs_cis, apply_rotary_emb
+        freqs_cos, freqs_sin = precompute_freqs_cis(HEAD_DIM_K, q.shape[2], theta, q.device)
+        q_rope = apply_rotary_emb(q, freqs_cos, freqs_sin).to(q.dtype)  # Keep original dtype
+        k_rope = apply_rotary_emb(k, freqs_cos, freqs_sin).to(k.dtype)  # Keep original dtype
+        
+        ctx.save_for_backward(q_rope, k_rope, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
@@ -712,13 +751,15 @@ class _attention(torch.autograd.Function):
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
+        
+        # k is already RoPE'd (saved from forward), now scale it
         arg_k = k
         arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
         PRE_BLOCK = 128
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
-        _attn_bwd_acess[pre_grid](
+        _attn_bwd_preprocess[pre_grid](
             o, do,  #
             delta,  #
             BATCH, N_HEAD, N_CTX,  #
