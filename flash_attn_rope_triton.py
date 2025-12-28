@@ -169,6 +169,70 @@ def _apply_rope_with_cos_sin(x, cos, sin, HEAD_DIM: tl.constexpr):
 
 
 @triton.jit
+def _apply_rope_kernel(
+    X, Out, theta,
+    stride_xz, stride_xh, stride_xtok, stride_xd,
+    stride_oz, stride_oh, stride_otok, stride_od,
+    Z, H, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Kernel to apply RoPE to entire tensor
+    Input/Output shape: [Z, H, N_CTX, HEAD_DIM]
+    """
+    # Program IDs
+    pid_z = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_ctx = tl.program_id(2)
+    
+    # Compute position for this token
+    position = pid_ctx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = position < N_CTX
+    
+    # Load input
+    offs_d = tl.arange(0, HEAD_DIM)
+    x_ptrs = X + pid_z * stride_xz + pid_h * stride_xh + position[:, None] * stride_xtok + offs_d[None, :] * stride_xd
+    x = tl.load(x_ptrs, mask=mask[:, None], other=0.0)
+    
+    # Apply RoPE
+    x_rope = _apply_rope(x, position, theta, HEAD_DIM)
+    
+    # Store output
+    o_ptrs = Out + pid_z * stride_oz + pid_h * stride_oh + position[:, None] * stride_otok + offs_d[None, :] * stride_od
+    tl.store(o_ptrs, x_rope, mask=mask[:, None])
+
+
+def apply_rope_tensor(x, theta):
+    """
+    Apply RoPE to entire tensor using Triton kernel
+    
+    Args:
+        x: [BATCH, N_HEAD, N_CTX, HEAD_DIM] - input tensor
+        theta: float - RoPE base
+        
+    Returns:
+        x_rope: [BATCH, N_HEAD, N_CTX, HEAD_DIM] - RoPE'd tensor
+    """
+    BATCH, N_HEAD, N_CTX, HEAD_DIM = x.shape
+    out = torch.empty_like(x)
+    
+    BLOCK_SIZE = 128
+    grid = (BATCH, N_HEAD, triton.cdiv(N_CTX, BLOCK_SIZE))
+    
+    _apply_rope_kernel[grid](
+        x, out, theta,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        BATCH, N_HEAD, N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return out
+
+
+@triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     desc_k, desc_v,  #
                     theta,  # RoPE base (scalar!)
@@ -722,14 +786,8 @@ class _attention(torch.autograd.Function):
             IS_HOPPER=is_hopper(),  #
             **extra_kern_args)
 
-        # Apply RoPE to q and k for saving (backward needs RoPE'd versions)
-        # Compute RoPE freqs and apply (matching what kernel does)
-        from rope_attn_pytorch import precompute_freqs_cis, apply_rotary_emb
-        freqs_cos, freqs_sin = precompute_freqs_cis(HEAD_DIM_K, q.shape[2], theta, q.device)
-        q_rope = apply_rotary_emb(q, freqs_cos, freqs_sin).to(q.dtype)  # Keep original dtype
-        k_rope = apply_rotary_emb(k, freqs_cos, freqs_sin).to(k.dtype)  # Keep original dtype
-        
-        ctx.save_for_backward(q_rope, k_rope, v, o, M)
+        # Save original q and k (RoPE is applied in kernel)
+        ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
@@ -752,9 +810,12 @@ class _attention(torch.autograd.Function):
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         
-        # k is already RoPE'd (saved from forward), now scale it
-        arg_k = k
-        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
+        # Apply RoPE to q and k (they are saved in original form from forward)
+        q = apply_rope_tensor(q, theta)
+        k = apply_rope_tensor(k, theta)
+        
+        # Now scale k for backward computation
+        arg_k = k * (ctx.sm_scale * RCP_LN2)
         PRE_BLOCK = 128
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
@@ -797,7 +858,7 @@ TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 @pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16):
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, theta, dtype=torch.float16):
     if mode == "fwd" and "fp16" in provider:
         pytest.skip("Avoid running the forward computation twice.")
     if mode == "bwd" and "fp8" in provider:
@@ -835,7 +896,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, warp_specialize).half()
+    tri_out = attention(q, k, v, causal, sm_scale, theta, warp_specialize).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -898,7 +959,7 @@ for HEAD_DIM in [64, 128]:
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, theta, device=DEVICE):
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
     if "triton" in provider:
@@ -912,7 +973,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
+        fn = lambda: attention(q, k, v, causal, sm_scale, theta, warp_specialize)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
