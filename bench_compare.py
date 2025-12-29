@@ -4,12 +4,19 @@ Flash Attention v2 原版 vs Fused RoPE 性能对比
 1. Flash Attention v2 原版（无 RoPE）
 2. Fused RoPE v2（最小化修改版本）
 3. Fused RoPE（过度优化版本）
+
+⚠️ 重要：使用 Triton 官方的 triton.testing.do_bench 进行 benchmark
+   - 正确处理 autotune（第一次调用时完成配置选择）
+   - 充分的 warmup 确保性能稳定
+   - 返回可靠的中位数时间
 """
 
 import torch
 import time
 import sys
 import os
+import triton
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 from flash_attn_v2_triton import attention as attention_v2
@@ -18,33 +25,35 @@ from flash_attn_rope_triton import attention as attention_rope_opt
 from utils import calc_sim, assert_similar, print_red_warning
 
 
-def benchmark_kernel(fn, *args, warmup=3, repeat=10):
-    """Benchmark a kernel with multiple runs"""
-    # Warmup
-    for _ in range(warmup):
-        fn(*args)
-    torch.cuda.synchronize()
+def benchmark_kernel(fn, warmup=25, rep=100):
+    """
+    Benchmark a kernel with Triton's do_bench (handles autotune correctly)
     
-    # Benchmark
-    times = []
-    for _ in range(repeat):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        
-        start.record()
-        fn(*args)
-        end.record()
-        
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
+    Args:
+        fn: Function to benchmark (no-arg lambda)
+        warmup: Number of warmup iterations (default: 25)
+        rep: Number of measurement iterations (default: 100)
     
-    # 返回中位数时间（更稳健）
-    times.sort()
-    median_time = times[len(times) // 2]
-    min_time = min(times)
-    max_time = max(times)
+    Returns:
+        median_time (ms), min_time (ms), max_time (ms)
+    """
+    # 使用 Triton 官方的 do_bench，它会：
+    # 1. 自动处理 autotune（第一次调用时完成）
+    # 2. 充分的 warmup
+    # 3. 返回稳定的中位数时间
+    median_ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.0, 1.0])
     
-    return median_time, min_time, max_time, times
+    # do_bench 返回 [median, min, max] 如果指定了 quantiles=[0.5, 0.0, 1.0]
+    # 否则只返回 median
+    if isinstance(median_ms, list) or isinstance(median_ms, tuple):
+        median_time, min_time, max_time = median_ms[0], median_ms[1], median_ms[2]
+    else:
+        # 如果只返回了 median，min/max 设为 median
+        median_time = median_ms
+        min_time = median_ms
+        max_time = median_ms
+    
+    return median_time, min_time, max_time
 
 
 def compute_flops(B, H, N, D, time_ms, mode='fwd'):
@@ -110,8 +119,14 @@ def test_correctness(B, H, N, D, causal=False):
     return True
 
 
-def test_performance(B, H, N, D, causal=False, mode='fwd', repeat=10):
-    """性能测试三个版本"""
+def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100):
+    """
+    性能测试三个版本（使用 Triton 官方 benchmark，正确处理 autotune）
+    
+    Args:
+        warmup: Warmup iterations（默认 25，确保 autotune 完成）
+        rep: Measurement iterations（默认 100）
+    """
     device = 'cuda'
     dtype = torch.float16
     
@@ -125,11 +140,11 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', repeat=10):
     results = {}
     
     # 1. Flash v2 原版
-    print("\n  [1. Flash v2 原版]", end=' ')
+    print("\n  [1. Flash v2 原版]", end=' ', flush=True)
     fn_v2 = lambda: attention_v2(q, k, v, causal, sm_scale, False)
     
     try:
-        median, min_t, max_t, _ = benchmark_kernel(fn_v2, warmup=3, repeat=repeat)
+        median, min_t, max_t = benchmark_kernel(fn_v2, warmup=warmup, rep=rep)
         tflops = compute_flops(B, H, N, D, median, mode)
         results['v2'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
@@ -138,11 +153,11 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', repeat=10):
         results['v2'] = None
     
     # 2. Fused RoPE v2（最小化修改）
-    print("  [2. Fused RoPE v2]", end=' ')
+    print("  [2. Fused RoPE v2]", end=' ', flush=True)
     fn_rope_v2 = lambda: attention_rope_v2(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
     
     try:
-        median, min_t, max_t, _ = benchmark_kernel(fn_rope_v2, warmup=3, repeat=repeat)
+        median, min_t, max_t = benchmark_kernel(fn_rope_v2, warmup=warmup, rep=rep)
         tflops = compute_flops(B, H, N, D, median, mode)
         results['rope_v2'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
@@ -151,11 +166,11 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', repeat=10):
         results['rope_v2'] = None
     
     # 3. Fused RoPE（过度优化）
-    print("  [3. Fused RoPE Opt]", end=' ')
+    print("  [3. Fused RoPE Opt]", end=' ', flush=True)
     fn_rope_opt = lambda: attention_rope_opt(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
     
     try:
-        median, min_t, max_t, _ = benchmark_kernel(fn_rope_opt, warmup=3, repeat=repeat)
+        median, min_t, max_t = benchmark_kernel(fn_rope_opt, warmup=warmup, rep=rep)
         tflops = compute_flops(B, H, N, D, median, mode)
         results['rope_opt'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
@@ -210,7 +225,7 @@ def main():
     
     # 性能测试
     print("\n" + "="*80)
-    print("第二步：性能对比（Forward Pass，每配置测试 10 次取中位数）")
+    print("第二步：性能对比（Forward Pass，使用 Triton do_bench，正确处理 autotune）")
     print("="*80)
     
     all_results = []
@@ -218,26 +233,26 @@ def main():
     for B, H, N, D, causal, name in configs:
         print(f"\n[配置: {name}] B={B}, H={H}, N={N}, D={D}")
         
-        # 根据序列长度动态调整测试次数
+        # 根据序列长度动态调整测试次数（使用 Triton benchmark）
+        # warmup: 确保 autotune 完成
+        # rep: 测量次数
         if N >= 262144:
-            repeat = 1  # 256K+ 只测 1 次（太大了）
+            warmup, rep = 10, 20   # 256K+ 测试少一点
         elif N >= 131072:
-            repeat = 2  # 128K 测 2 次
+            warmup, rep = 15, 30   # 128K
         elif N >= 65536:
-            repeat = 2  # 64K 测 2 次
+            warmup, rep = 20, 50   # 64K
         elif N >= 32768:
-            repeat = 3  # 32K 测 3 次
+            warmup, rep = 25, 75   # 32K
         elif N >= 8192:
-            repeat = 5  # 8K-16K 测 5 次
-        elif N >= 4096:
-            repeat = 7  # 4K 测 7 次
+            warmup, rep = 25, 100  # 8K-16K
         else:
-            repeat = 10  # ≤2K 测 10 次
+            warmup, rep = 25, 100  # ≤4K 标准测试
         
-        print(f"  (测试 {repeat} 次取中位数)")
+        print(f"  (Warmup={warmup}, Rep={rep}, 使用 Triton do_bench)")
         
         try:
-            results = test_performance(B, H, N, D, causal, mode='fwd', repeat=repeat)
+            results = test_performance(B, H, N, D, causal, mode='fwd', warmup=warmup, rep=rep)
             results['config'] = name
             all_results.append(results)
         except Exception as e:
