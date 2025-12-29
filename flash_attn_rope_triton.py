@@ -19,7 +19,6 @@ import os
 
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -48,9 +47,10 @@ def is_hopper():
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
-                    desc_k, desc_v,  #
+                    K, V,  #
                     freqs_cos_ptr, freqs_sin_ptr,  #
-                    stride_freqs_seq, stride_freqs_dim,  #
+                    stride_k_seq, stride_v_seq,  #
+                    freqs_cos_stride_seq, freqs_sin_stride_seq,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
@@ -64,39 +64,37 @@ def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
     # causal = False
     else:
         lo, hi = 0, N_CTX
-    offsetk_y = offset_y + lo
-    if dtype == tl.float8e5:
-        offsetv_y = offset_y * HEAD_DIM + lo
-    else:
-        offsetv_y = offset_y + lo
     # Prepare dimension indices for RoPE frequency loading
     half_dim: tl.constexpr = HEAD_DIM // 2
     offs_d_first = tl.arange(0, half_dim)
+    offs_d_second = half_dim + tl.arange(0, half_dim)
+    
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n_local = start_n + offs_n
         
-        # -- load K and apply RoPE --
-        k = desc_k.load([offsetk_y, 0]).T  # [HEAD_DIM, BLOCK_N]
-        k = tl.trans(k)  # [BLOCK_N, HEAD_DIM]
+        # -- 物理双指针加载 K (Scheme C) --
+        k1_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_first[None, :]
+        k2_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_second[None, :]
         
-        # Extract two halves from K using reshape+permute+split
-        k1, k2 = k.reshape([BLOCK_N, 2, half_dim]).permute(0, 2, 1).split()
+        mask_k = (offs_n_local[:, None] < N_CTX)
+        k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
+        k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
         
         # Load RoPE frequencies for K positions
-        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
-        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
-        mask_k_half = (offs_n_local[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+        freqs_cos_k_ptrs = freqs_cos_ptr + offs_n_local[:, None] * freqs_cos_stride_seq + offs_d_first[None, :]
+        freqs_sin_k_ptrs = freqs_sin_ptr + offs_n_local[:, None] * freqs_sin_stride_seq + offs_d_first[None, :]
+        
+        mask_k_half = (offs_n_local[:, None] < N_CTX)
         cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
         sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
 
         # Apply RoPE rotation
-        k1_rot = k1 * cos_k - k2 * sin_k
-        k2_rot = k2 * cos_k + k1 * sin_k
+        k1_rot = (k1 * cos_k - k2 * sin_k).to(dtype)
+        k2_rot = (k2 * cos_k + k1 * sin_k).to(dtype)
 
         # -- 双 dot 累加计算 qk (Dual-Dot Accumulation) --
-        # 关键优化：分两次计算并累加，避免拼接 K
         qk = tl.dot(q1_rot, tl.trans(k1_rot))  # Q1 * K1^T
         qk += tl.dot(q2_rot, tl.trans(k2_rot))  # Q2 * K2^T (累加)
         if STAGE == 2:
@@ -121,96 +119,30 @@ def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
             acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
         else:
             acc = acc * alpha[:, None]
-        # prepare p and v for the dot
-        if dtype == tl.float8e5:
-            v = desc_v.load([0, offsetv_y]).T
-        else:
-            v = desc_v.load([offsetv_y, 0])
+            
+        # -- 物理指针加载 V --
+        v_ptrs = V + offs_n_local[:, None] * stride_v_seq + tl.arange(0, HEAD_DIM)[None, :]
+        v = tl.load(v_ptrs, mask=mask_k, other=0.0)
+        
         p = p.to(dtype)
-        # note that this non transposed v for FP8 is only supported on Blackwell
         acc = tl.dot(p, v, acc)
         # update m_i and l_i
-        # place this at the end of the loop to reduce register pressure
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        offsetk_y += BLOCK_N
-        offsetv_y += BLOCK_N
     return acc, l_i, m_i
-
-
-def _host_descriptor_pre_hook(nargs):
-    BLOCK_M = nargs["BLOCK_M"]
-    BLOCK_N = nargs["BLOCK_N"]
-    HEAD_DIM = nargs["HEAD_DIM"]
-    if not isinstance(nargs["desc_q"], TensorDescriptor):
-        return
-    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
-    if nargs["FP8_OUTPUT"]:
-        nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
-    else:
-        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
-
-
-if is_hip():
-    NUM_STAGES_OPTIONS = [1]
-elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [2, 3, 4]
-else:
-    NUM_STAGES_OPTIONS = [2, 3, 4]
-
-configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BM in [64, 128]\
-    for BN in [32, 64, 128]\
-    for s in NUM_STAGES_OPTIONS \
-    for w in [4, 8]\
-]
-if "PYTEST_VERSION" in os.environ:
-    # Use a single config in testing for reproducibility
-    configs = [
-        triton.Config(dict(BLOCK_M=128, BLOCK_N=64), num_stages=2, num_warps=4, pre_hook=_host_descriptor_pre_hook),
-    ]
-
-
-def keep(conf):
-    BLOCK_M = conf.kwargs["BLOCK_M"]
-    BLOCK_N = conf.kwargs["BLOCK_N"]
-    return not (is_cuda() and torch.cuda.get_device_capability()[0] == 9 and BLOCK_M * BLOCK_N < 128 * 128
-                and conf.num_warps == 8)
-
-
-def prune_invalid_configs(configs, named_args, **kwargs):
-    N_CTX = kwargs["N_CTX"]
-    STAGE = kwargs["STAGE"]
-
-    # Filter out configs where BLOCK_M > N_CTX
-    # Filter out configs where BLOCK_M < BLOCK_N when causal is True
-    return [
-        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
-            conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
-    ]
-
-
-@triton.jit
-def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
-    if isinstance(desc_or_ptr, tl.tensor_descriptor):
-        return desc_or_ptr
-    else:
-        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
 # Autotune with single config to avoid compiler bugs
 @triton.autotune(
-    configs=[triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=4, pre_hook=_host_descriptor_pre_hook)],
+    configs=[triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=4)],
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"]
 )
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               freqs_cos_ptr, freqs_sin_ptr,  #
               stride_freqs_seq, stride_freqs_dim,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+              Z, H, Q, K, V, O, N_CTX,  #
+              stride_qz, stride_qh, stride_qm, stride_qk,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -226,23 +158,13 @@ def _attn_fwd(sm_scale, M,  #
     off_z = off_hz // H
     off_h = off_hz % H
 
-    y_dim = Z * H * N_CTX
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
-    if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
-                                         block_shape=[HEAD_DIM, BLOCK_N])
-    else:
-        
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                         block_shape=[BLOCK_N, HEAD_DIM])
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
+    # 计算当前 head 的基地址
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_qz + off_h * stride_qh
+    v_base = V + off_z * stride_qz + off_h * stride_qh
+    o_base = O + off_z * stride_qz + off_h * stride_qh
 
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -253,36 +175,37 @@ def _attn_fwd(sm_scale, M,  #
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
-    # load q: it will stay in SRAM throughout
-    q = desc_q.load([qo_offset_y, 0])
 
-    # Apply RoPE to Q using direct pointer-style computation
-    # Split Q into two halves and apply rotation formula
     half_dim: tl.constexpr = HEAD_DIM // 2
     offs_d_first = tl.arange(0, half_dim)
+    offs_d_second = half_dim + tl.arange(0, half_dim)
 
-    # Load cos/sin frequencies for first half (these apply to both halves in split layout)
-    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
-    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
-    mask_q_half = (offs_m[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
-    cos_half = tl.load(freqs_cos_q_ptrs, mask=mask_q_half, other=1.0).to(tl.float32)
-    sin_half = tl.load(freqs_sin_q_ptrs, mask=mask_q_half, other=0.0).to(tl.float32)
+    # -- 物理双指针加载 Q (Scheme C) --
+    q1_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_first[None, :]
+    q2_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_second[None, :]
+    
+    mask_q = (offs_m[:, None] < N_CTX)
+    q1 = tl.load(q1_ptrs, mask=mask_q, other=0.0)
+    q2 = tl.load(q2_ptrs, mask=mask_q, other=0.0)
 
-    # Extract two halves from Q using reshape+permute+split
-    q1, q2 = q.reshape([BLOCK_M, 2, half_dim]).permute(0, 2, 1).split()
+    # Load cos/sin frequencies for Q
+    freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :]
+    freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :]
+    
+    cos_half = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
+    sin_half = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
 
     # Apply RoPE rotation
-    q1_rot = q1 * cos_half - q2 * sin_half
-    q2_rot = q2 * cos_half + q1 * sin_half
+    q1_rot = (q1 * cos_half - q2 * sin_half).to(dtype)
+    q2_rot = (q2 * cos_half + q1 * sin_half).to(dtype)
 
     # stage 1: off-band
-    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
-    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
-                                        desc_k, desc_v,  #
+                                        k_base, v_base,  #
                                         freqs_cos_ptr, freqs_sin_ptr,  #
-                                        stride_freqs_seq, stride_freqs_dim,  #
+                                        stride_qm, stride_qm,  #
+                                        stride_freqs_seq, stride_freqs_seq,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
@@ -290,9 +213,10 @@ def _attn_fwd(sm_scale, M,  #
     # stage 2: on-band
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
-                                        desc_k, desc_v,  #
+                                        k_base, v_base,  #
                                         freqs_cos_ptr, freqs_sin_ptr,  #
-                                        stride_freqs_seq, stride_freqs_dim,  #
+                                        stride_qm, stride_qm,  #
+                                        stride_freqs_seq, stride_freqs_seq,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
@@ -302,7 +226,10 @@ def _attn_fwd(sm_scale, M,  #
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    desc_o.store([qo_offset_y, 0], acc.to(dtype))
+    
+    # -- 物理指针写回 O --
+    o_ptrs = o_base + offs_m[:, None] * stride_qm + tl.arange(0, HEAD_DIM)[None, :]
+    tl.store(o_ptrs, acc.to(dtype), mask=mask_q)
 
 
 @triton.jit
@@ -714,31 +641,6 @@ class _attention(torch.autograd.Function):
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        # Use device_descriptor for Hopper + warpspec.
-        if supports_host_descriptor() and not (is_hopper() and warp_specialize):
-            # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
-
-            dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
-                                          block_shape=dummy_block)
-            else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
-                                          block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-        else:
-            desc_q = q
-            desc_v = v
-            desc_k = k
-            desc_o = o
-
-        def alloc_fn(size: int, align: int, _):
-            return torch.empty(size, dtype=torch.int8, device="cuda")
-
-        triton.set_allocator(alloc_fn)
 
         def grid(META):
             return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
@@ -749,14 +651,16 @@ class _attention(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 168
             else:
                 extra_kern_args["maxnreg"] = 80
+                
         _attn_fwd[grid](
             sm_scale, M,  #
             freqs_cos, freqs_sin,  #
             freqs_cos.stride(0),  #
             freqs_cos.stride(1),  #
             q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
-            N_CTX=q.shape[2],  #
+            q, k, v, o,  #
+            q.shape[2],  # N_CTX
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
