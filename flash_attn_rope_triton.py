@@ -69,22 +69,28 @@ def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
     offs_d_first = tl.arange(0, half_dim)
     offs_d_second = half_dim + tl.arange(0, half_dim)
     
+    # 对齐断言优化：对基地址进行断言，强制 128-bit 向量化加载
+    freqs_cos_base = tl.multiple_of(freqs_cos_ptr, 16)
+    freqs_sin_base = tl.multiple_of(freqs_sin_ptr, 16)
+    K_aligned = tl.multiple_of(K, 16)
+    V_aligned = tl.multiple_of(V, 16)
+    
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n_local = start_n + offs_n
         
-        # -- 物理双指针加载 K (Scheme C) --
-        k1_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_first[None, :] * stride_k_dim
-        k2_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_second[None, :] * stride_k_dim
+        # -- 物理双指针加载 K (Scheme C，使用对齐基地址) --
+        k1_ptrs = K_aligned + offs_n_local[:, None] * stride_k_seq + offs_d_first[None, :] * stride_k_dim
+        k2_ptrs = K_aligned + offs_n_local[:, None] * stride_k_seq + offs_d_second[None, :] * stride_k_dim
         
         mask_k = (offs_n_local[:, None] < N_CTX)
         k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
         k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
         
-        # Load RoPE frequencies for K positions
-        freqs_cos_k_ptrs = freqs_cos_ptr + offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
-        freqs_sin_k_ptrs = freqs_sin_ptr + offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+        # Load RoPE frequencies for K positions (使用对齐基地址)
+        freqs_cos_k_ptrs = freqs_cos_base + offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+        freqs_sin_k_ptrs = freqs_sin_base + offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
         
         mask_k_half = (offs_n_local[:, None] < N_CTX)
         cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
@@ -112,8 +118,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
         # -- update output accumulator --
         acc = acc * alpha[:, None]
             
-        # -- 物理指针加载 V --
-        v_ptrs = V + offs_n_local[:, None] * stride_v_seq + tl.arange(0, HEAD_DIM)[None, :] * stride_v_dim
+        # -- 物理指针加载 V (使用对齐基地址) --
+        v_ptrs = V_aligned + offs_n_local[:, None] * stride_v_seq + tl.arange(0, HEAD_DIM)[None, :] * stride_v_dim
         v = tl.load(v_ptrs, mask=mask_k, other=0.0)
         
         p = p.to(dtype)
@@ -172,17 +178,22 @@ def _attn_fwd(sm_scale, M,  #
     offs_d_first = tl.arange(0, half_dim)
     offs_d_second = half_dim + tl.arange(0, half_dim)
 
-    # -- 物理双指针加载 Q (Scheme C) --
-    q1_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_first[None, :] * stride_qk
-    q2_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_second[None, :] * stride_qk
+    # 对齐断言优化：对基地址进行断言，强制 128-bit 向量化加载
+    q_base_aligned = tl.multiple_of(q_base, 16)
+    freqs_cos_base = tl.multiple_of(freqs_cos_ptr, 16)
+    freqs_sin_base = tl.multiple_of(freqs_sin_ptr, 16)
+
+    # -- 物理双指针加载 Q (Scheme C，使用对齐基地址) --
+    q1_ptrs = q_base_aligned + offs_m[:, None] * stride_qm + offs_d_first[None, :] * stride_qk
+    q2_ptrs = q_base_aligned + offs_m[:, None] * stride_qm + offs_d_second[None, :] * stride_qk
     
     mask_q = (offs_m[:, None] < N_CTX)
     q1 = tl.load(q1_ptrs, mask=mask_q, other=0.0)
     q2 = tl.load(q2_ptrs, mask=mask_q, other=0.0)
 
-    # Load cos/sin frequencies for Q
-    freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
-    freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+    # Load cos/sin frequencies for Q (使用对齐基地址)
+    freqs_cos_q_ptrs = freqs_cos_base + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+    freqs_sin_q_ptrs = freqs_sin_base + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
     
     cos_half = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
     sin_half = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
@@ -265,16 +276,21 @@ def _attn_bwd_dkdv(dk1, dk2, dv,  #
     offs_d_first = tl.arange(0, half_dim)
     offs_d_second = half_dim + tl.arange(0, half_dim)
 
-    # -- 物理双指针加载 K (Scheme C) --
-    k1_ptrs = K + offs_n[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-    k2_ptrs = K + offs_n[:, None] * stride_tok + offs_d_second[None, :] * stride_d
+    # 对齐断言优化：对基地址进行断言
+    K_aligned = tl.multiple_of(K, 16)
+    freqs_cos_base = tl.multiple_of(freqs_cos_ptr, 16)
+    freqs_sin_base = tl.multiple_of(freqs_sin_ptr, 16)
+
+    # -- 物理双指针加载 K (Scheme C，使用对齐基地址) --
+    k1_ptrs = K_aligned + offs_n[:, None] * stride_tok + offs_d_first[None, :] * stride_d
+    k2_ptrs = K_aligned + offs_n[:, None] * stride_tok + offs_d_second[None, :] * stride_d
     mask_k = (offs_n[:, None] < N_CTX)
     k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
     k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
 
-    # Load RoPE frequencies for K positions
-    freqs_cos_k_ptrs = freqs_cos_ptr + offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
-    freqs_sin_k_ptrs = freqs_sin_ptr + offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+    # Load RoPE frequencies for K positions (使用对齐基地址)
+    freqs_cos_k_ptrs = freqs_cos_base + offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+    freqs_sin_k_ptrs = freqs_sin_base + offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
     
     cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
     sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
@@ -369,6 +385,12 @@ def _attn_bwd_dq(dq1, dq2, q1_rot, q2_rot, K, V,  #
     offs_d_first = tl.arange(0, half_dim)
     offs_d_second = half_dim + tl.arange(0, half_dim)
 
+    # 对齐断言优化：对基地址进行断言
+    K_aligned = tl.multiple_of(K, 16)
+    V_aligned = tl.multiple_of(V, 16)
+    freqs_cos_base = tl.multiple_of(freqs_cos_ptr, 16)
+    freqs_sin_base = tl.multiple_of(freqs_sin_ptr, 16)
+
     # D (= delta) is pre-divided by ds_scale
     Di = tl.load(D + offs_m)[:, None]
     
@@ -381,16 +403,16 @@ def _attn_bwd_dq(dq1, dq2, q1_rot, q2_rot, K, V,  #
         offs_n_curr = curr_n + tl.arange(0, BLOCK_N2)
         mask_k = (offs_n_curr[:, None] < N_CTX)
         
-        # Load RoPE frequencies for K positions
-        freqs_cos_k_ptrs = freqs_cos_ptr + offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
-        freqs_sin_k_ptrs = freqs_sin_ptr + offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+        # Load RoPE frequencies for K positions (使用对齐基地址)
+        freqs_cos_k_ptrs = freqs_cos_base + offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+        freqs_sin_k_ptrs = freqs_sin_base + offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
         
         cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
         sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
 
-        # -- 物理双指针加载 K (Scheme C) --
-        k1_ptrs = K + offs_n_curr[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-        k2_ptrs = K + offs_n_curr[:, None] * stride_tok + offs_d_second[None, :] * stride_d
+        # -- 物理双指针加载 K (Scheme C，使用对齐基地址) --
+        k1_ptrs = K_aligned + offs_n_curr[:, None] * stride_tok + offs_d_first[None, :] * stride_d
+        k2_ptrs = K_aligned + offs_n_curr[:, None] * stride_tok + offs_d_second[None, :] * stride_d
         k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
         k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
         
@@ -398,8 +420,8 @@ def _attn_bwd_dq(dq1, dq2, q1_rot, q2_rot, K, V,  #
         k1_rot = (k1 * cos_k - k2 * sin_k).to(tl.float16)
         k2_rot = (k2 * cos_k + k1 * sin_k).to(tl.float16)
 
-        # Load V
-        v_ptrs = V + offs_n_curr[:, None] * stride_tok + offs_k[None, :] * stride_d
+        # Load V (使用对齐基地址)
+        v_ptrs = V_aligned + offs_n_curr[:, None] * stride_tok + offs_k[None, :] * stride_d
         v = tl.load(v_ptrs, mask=mask_k, other=0.0)
         
         # -- 双 dot 累加计算 qk (Dual-Dot Accumulation) --
@@ -545,15 +567,20 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     mask_q = (offs_m[:, None] < N_CTX)
 
-    # -- 物理双指针加载 Q (Scheme C) --
-    q1_ptrs = Q + offs_m[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-    q2_ptrs = Q + offs_m[:, None] * stride_tok + offs_d_second[None, :] * stride_d
+    # 对齐断言优化：对基地址进行断言
+    Q_aligned = tl.multiple_of(Q, 16)
+    freqs_cos_base_q = tl.multiple_of(freqs_cos_ptr, 16)
+    freqs_sin_base_q = tl.multiple_of(freqs_sin_ptr, 16)
+
+    # -- 物理双指针加载 Q (Scheme C，使用对齐基地址) --
+    q1_ptrs = Q_aligned + offs_m[:, None] * stride_tok + offs_d_first[None, :] * stride_d
+    q2_ptrs = Q_aligned + offs_m[:, None] * stride_tok + offs_d_second[None, :] * stride_d
     q1 = tl.load(q1_ptrs, mask=mask_q, other=0.0)
     q2 = tl.load(q2_ptrs, mask=mask_q, other=0.0)
     
-    # Load RoPE frequencies for Q positions
-    freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
-    freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+    # Load RoPE frequencies for Q positions (使用对齐基地址)
+    freqs_cos_q_ptrs = freqs_cos_base_q + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+    freqs_sin_q_ptrs = freqs_sin_base_q + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
     cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
     sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
     
