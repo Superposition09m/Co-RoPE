@@ -47,7 +47,7 @@ def is_hopper():
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q,  #
+def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
                     desc_k, desc_v,  #
                     freqs_cos_ptr, freqs_sin_ptr,  #
                     stride_freqs_seq, stride_freqs_dim,  #
@@ -75,33 +75,30 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        # -- load K and apply RoPE --
-        k = desc_k.load([offsetk_y, 0]).T  # k is now [HEAD_DIM, BLOCK_N]
-
-        # Transpose K to [BLOCK_N, HEAD_DIM] for RoPE application
-        k = tl.trans(k)  # Now [BLOCK_N, HEAD_DIM]
-
-        # Load RoPE frequencies for K positions (only need first half for split layout)
         offs_n_local = start_n + offs_n
+        
+        # -- load K and apply RoPE --
+        k = desc_k.load([offsetk_y, 0]).T  # [HEAD_DIM, BLOCK_N]
+        k = tl.trans(k)  # [BLOCK_N, HEAD_DIM]
+        
+        # Extract two halves from K using reshape+permute+split
+        k1, k2 = k.reshape([BLOCK_N, 2, half_dim]).permute(0, 2, 1).split()
+        
+        # Load RoPE frequencies for K positions
         freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
         freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
         mask_k_half = (offs_n_local[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
-        cos_k_half = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
-        sin_k_half = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
-
-        # Extract two halves from K using reshape+permute+split (tensor descriptor case)
-        k1, k2 = k.reshape([BLOCK_N, 2, half_dim]).permute(0, 2, 1).split()
+        cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
+        sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
 
         # Apply RoPE rotation
-        k1_new = k1 * cos_k_half - k2 * sin_k_half
-        k2_new = k2 * cos_k_half + k1 * sin_k_half
+        k1_rot = k1 * cos_k - k2 * sin_k
+        k2_rot = k2 * cos_k + k1 * sin_k
 
-        # Rejoin: need to permute+reshape to restore original layout
-        k = tl.join(k1_new, k2_new).permute(0, 2, 1).reshape([BLOCK_N, HEAD_DIM])
-        k = tl.trans(k)  # [HEAD_DIM, BLOCK_N]
-
-        # -- compute qk ----
-        qk = tl.dot(q, k)
+        # -- 双 dot 累加计算 qk (Dual-Dot Accumulation) --
+        # 关键优化：分两次计算并累加，避免拼接 K
+        qk = tl.dot(q1_rot, tl.trans(k1_rot))  # Q1 * K1^T
+        qk += tl.dot(q2_rot, tl.trans(k2_rot))  # Q2 * K2^T (累加)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -271,21 +268,18 @@ def _attn_fwd(sm_scale, M,  #
     cos_half = tl.load(freqs_cos_q_ptrs, mask=mask_q_half, other=1.0).to(tl.float32)
     sin_half = tl.load(freqs_sin_q_ptrs, mask=mask_q_half, other=0.0).to(tl.float32)
 
-    # Extract two halves from Q using reshape+permute+split (tensor descriptor case)
+    # Extract two halves from Q using reshape+permute+split
     q1, q2 = q.reshape([BLOCK_M, 2, half_dim]).permute(0, 2, 1).split()
 
-    # Apply RoPE rotation: [q1, q2] -> [q1*cos - q2*sin, q2*cos + q1*sin]
-    q1_new = q1 * cos_half - q2 * sin_half
-    q2_new = q2 * cos_half + q1 * sin_half
-
-    # Rejoin: need to permute+reshape to restore original layout
-    q = tl.join(q1_new, q2_new).permute(0, 2, 1).reshape([BLOCK_M, HEAD_DIM])
+    # Apply RoPE rotation
+    q1_rot = q1 * cos_half - q2 * sin_half
+    q2_rot = q2 * cos_half + q1 * sin_half
 
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
                                         desc_k, desc_v,  #
                                         freqs_cos_ptr, freqs_sin_ptr,  #
                                         stride_freqs_seq, stride_freqs_dim,  #
@@ -295,7 +289,7 @@ def _attn_fwd(sm_scale, M,  #
                                         warp_specialize, IS_HOPPER)
     # stage 2: on-band
     if STAGE & 2:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
                                         desc_k, desc_v,  #
                                         freqs_cos_ptr, freqs_sin_ptr,  #
                                         stride_freqs_seq, stride_freqs_dim,  #
