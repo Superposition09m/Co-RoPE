@@ -43,6 +43,12 @@ def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
 
 
+if is_hip():
+    NUM_STAGES_OPTIONS = [1]
+elif supports_host_descriptor():
+    NUM_STAGES_OPTIONS = [2, 3, 4]
+else:
+    NUM_STAGES_OPTIONS = [2, 3, 4]
 
 
 @triton.jit
@@ -130,11 +136,41 @@ def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
     return acc, l_i, m_i
 
 
-# Autotune with single config to avoid compiler bugs
-@triton.autotune(
-    configs=[triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=4)],
-    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"]
-)
+configs = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    for BM in [64, 128]\
+    for BN in [32, 64, 128]\
+    for s in NUM_STAGES_OPTIONS \
+    for w in [4, 8]\
+]
+if "PYTEST_VERSION" in os.environ:
+    # Use a single config in testing for reproducibility
+    configs = [
+        triton.Config(dict(BLOCK_M=128, BLOCK_N=64), num_stages=2, num_warps=4),
+    ]
+
+
+def keep(conf):
+    BLOCK_M = conf.kwargs["BLOCK_M"]
+    BLOCK_N = conf.kwargs["BLOCK_N"]
+    return not (is_cuda() and torch.cuda.get_device_capability()[0] == 9 and BLOCK_M * BLOCK_N < 128 * 128
+                and conf.num_warps == 8)
+
+
+def prune_invalid_configs(configs, named_args, **kwargs):
+    N_CTX = kwargs["N_CTX"]
+    STAGE = kwargs["STAGE"]
+
+    # Filter out configs where BLOCK_M > N_CTX
+    # Filter out configs where BLOCK_M < BLOCK_N when causal is True
+    return [
+        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
+            conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
+    ]
+
+
+@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+                 prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               freqs_cos_ptr, freqs_sin_ptr,  #
