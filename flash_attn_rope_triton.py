@@ -348,7 +348,25 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
 
-    # K is pre-rotated in Python host, use directly without applying RoPE here
+    # Apply inverse RoPE to k (use -sin for inverse rotation)
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_d_first = tl.arange(0, half_dim)
+    offs_d_second = half_dim + tl.arange(0, half_dim)
+
+    # Load RoPE frequencies for K positions (only need first half)
+    freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    mask_k_half = (offs_n[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+    cos_k_half = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
+    sin_k_half = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
+
+    # Extract two halves from k (already loaded tensor, not a pointer) using reshape+split
+    k1, k2 = k.reshape([BLOCK_N1, 2, half_dim]).permute(0, 2, 1).split()
+    
+    # Forward RoPE: use +sin (reconstruct rotated K for recomputation)
+    k1_rot = k1 * cos_k_half - k2 * sin_k_half
+    k2_rot = k2 * cos_k_half + k1 * sin_k_half
+    k = tl.join(k1_rot, k2_rot).permute(0, 2, 1).reshape([BLOCK_N1, HEAD_DIM]).to(tl.float16)
 
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -357,14 +375,30 @@ def _attn_bwd_dkdv(dk, dv,  #
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
-        # Q is pre-rotated in Python host, directly load and use
+        # Load RoPE frequencies for Q positions (only need first half)
         offs_m_curr = curr_m + tl.arange(0, BLOCK_M1)
-        qT_ptrs = Q + offs_m_curr[:, None] * stride_tok + offs_k[None, :] * stride_d
-        qT = tl.load(qT_ptrs)
+        freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        mask_q_half = (offs_m_curr[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+        cos_q_half = tl.load(freqs_cos_q_ptrs, mask=mask_q_half, other=1.0).to(tl.float32)
+        sin_q_half = tl.load(freqs_sin_q_ptrs, mask=mask_q_half, other=0.0).to(tl.float32)
+
+        # Load Q in two halves directly using pointer arithmetic
+        q1_ptrs = Q + offs_m_curr[:, None] * stride_tok + offs_d_first[None, :] * stride_d
+        q2_ptrs = Q + offs_m_curr[:, None] * stride_tok + offs_d_second[None, :] * stride_d
+        q1 = tl.load(q1_ptrs)
+        q2 = tl.load(q2_ptrs)
+        
+        # Forward RoPE: use +sin (reconstruct rotated Q for recomputation)
+        q1_rot = q1 * cos_q_half - q2 * sin_q_half
+        q2_rot = q2 * cos_q_half + q1 * sin_q_half
+        qT = tl.join(q1_rot, q2_rot).permute(0, 2, 1).reshape([BLOCK_M1, HEAD_DIM])
+
+        # Transpose to [HEAD_DIM, BLOCK_M1] and convert back to float16
         qT = tl.trans(qT).to(tl.float16)
 
-        # Load m before computing qk to reduce pipeline stall
-        offs_m_load = offs_m_curr
+        # Load m before computing qk to reduce pipeline stall.
+        offs_m_load = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m_load)
         qkT = tl.dot(k, qT)
         pT = tl.math.exp2(qkT - m[None, :])
@@ -412,7 +446,25 @@ def _attn_bwd_dq(dq, q, K, V,  #
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
 
-    # Q is pre-rotated in Python host, use directly without applying RoPE here
+    # Apply inverse RoPE to q
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_d_first = tl.arange(0, half_dim)
+    offs_d_second = half_dim + tl.arange(0, half_dim)
+
+    # Load RoPE frequencies for Q positions (only need first half)
+    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    mask_q_half = (offs_m[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+    cos_q_half = tl.load(freqs_cos_q_ptrs, mask=mask_q_half, other=1.0).to(tl.float32)
+    sin_q_half = tl.load(freqs_sin_q_ptrs, mask=mask_q_half, other=0.0).to(tl.float32)
+
+    # Extract two halves from q (already loaded tensor, not a pointer) using reshape+split
+    q1, q2 = q.reshape([BLOCK_M2, 2, half_dim]).permute(0, 2, 1).split()
+    
+    # Forward RoPE: use +sin (reconstruct rotated Q for recomputation)
+    q1_rot = q1 * cos_q_half - q2 * sin_q_half
+    q2_rot = q2 * cos_q_half + q1 * sin_q_half
+    q = tl.join(q1_rot, q2_rot).permute(0, 2, 1).reshape([BLOCK_M2, HEAD_DIM]).to(tl.float16)
 
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
@@ -423,13 +475,29 @@ def _attn_bwd_dq(dq, q, K, V,  #
     curr_n = start_n
     step_n = BLOCK_N2
     for blk_idx in range(num_steps):
-        # K is pre-rotated in Python host, directly load and use
-        offs_n_curr = curr_n + tl.arange(0, BLOCK_N2)
-        kT_ptrs = K + offs_n_curr[:, None] * stride_tok + offs_k[None, :] * stride_d
-        kT = tl.load(kT_ptrs)
-        kT = tl.trans(kT).to(tl.float16)
-
         vT = tl.load(vT_ptrs)
+
+        # Load RoPE frequencies for K positions (only need first half)
+        offs_n_curr = curr_n + tl.arange(0, BLOCK_N2)
+        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        mask_k_half = (offs_n_curr[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+        cos_k_half = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
+        sin_k_half = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
+
+        # Load K in two halves directly using pointer arithmetic
+        k1_ptrs = K + offs_n_curr[:, None] * stride_tok + offs_d_first[None, :] * stride_d
+        k2_ptrs = K + offs_n_curr[:, None] * stride_tok + offs_d_second[None, :] * stride_d
+        k1 = tl.load(k1_ptrs)
+        k2 = tl.load(k2_ptrs)
+        
+        # Forward RoPE: use +sin (reconstruct rotated K for recomputation)
+        k1_rot = k1 * cos_k_half - k2 * sin_k_half
+        k2_rot = k2 * cos_k_half + k1 * sin_k_half
+        kT = tl.join(k1_rot, k2_rot).permute(0, 2, 1).reshape([BLOCK_N2, HEAD_DIM])
+
+        # Transpose to [HEAD_DIM, BLOCK_N2] and convert back to float16
+        kT = tl.trans(kT).to(tl.float16)
 
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
@@ -713,12 +781,6 @@ class _attention(torch.autograd.Function):
         q, k, v, o, M, freqs_cos, freqs_sin = ctx.saved_tensors
         assert do.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
-
-        # Pre-rotate Q and K in Python host to eliminate in-loop rotation in Triton kernels
-        from rope_attn_pytorch import apply_rotary_emb
-        q_rotated = apply_rotary_emb(q, freqs_cos, freqs_sin)
-        k_rotated = apply_rotary_emb(k, freqs_cos, freqs_sin)
-
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
@@ -728,8 +790,8 @@ class _attention(torch.autograd.Function):
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
-        # Use pre-rotated K for backward pass
-        arg_k = k_rotated * (ctx.sm_scale * RCP_LN2)
+        arg_k = k
+        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
         PRE_BLOCK = 128
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
@@ -742,9 +804,9 @@ class _attention(torch.autograd.Function):
         )
         grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
         _attn_bwd[grid](
-            q_rotated, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  # Pass pre-rotated Q and scaled K
+            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
             M, delta,  #
-            freqs_cos, freqs_sin,  # Keep for inverse rotation of gradients
+            freqs_cos, freqs_sin,  #
             freqs_cos.stride(0),  #
             freqs_cos.stride(1),  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
