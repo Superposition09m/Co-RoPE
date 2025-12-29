@@ -68,6 +68,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+@torch.compile
 def apply_rotary_emb(x, freqs_cos, freqs_sin):
     """
     Apply rotary position embedding
