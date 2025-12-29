@@ -708,8 +708,8 @@ class _attention(torch.autograd.Function):
             freqs_cos.stride(1),  #
             q.shape[0], q.shape[1],  #
             q, k, v, o,  #
-            q.shape[2],  # N_CTX
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            N_CTX=q.shape[2],  #
+            stride_qz=q.stride(0), stride_qh=q.stride(1), stride_qm=q.stride(2), stride_qk=q.stride(3),  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
