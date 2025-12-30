@@ -6,67 +6,6 @@ This is used as a baseline to compare with Triton implementation
 import torch
 import torch.nn.functional as F
 
-
-@torch.compile
-def precompute_freqs_cis(dim, seq_len, theta, device='cuda'):
-    """
-    Precompute cos and sin values for RoPE
-    Since this is PyTorch version, we cache the freqs instead of computing them in a fused kernel
-
-    Args:
-        dim: head_dim, must be even
-        seq_len: sequence length
-        theta: base for frequency computation (e.g., 10000.0)
-        device: device to create tensors on
-
-    Returns:
-        freqs_cos: (seq_len, dim) - cos values, each frequency repeated twice
-        freqs_sin: (seq_len, dim) - sin values, each frequency repeated twice
-    """
-    assert dim % 2 == 0, f"dim must be even, got {dim}"
-
-    # Compute frequencies: theta_i = base^(-2i/dim), i in [0, dim//2 - 1]
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
-    # freqs shape: (dim // 2,)
-
-    # Position indices: m in [0, seq_len - 1]
-    t = torch.arange(seq_len, device=device, dtype=torch.float32)
-    # t shape: (seq_len,)
-
-    # Compute m * theta_i
-    freqs = torch.outer(t, freqs)  # (seq_len, dim // 2)
-
-    # Compute cos and sin
-    freqs_cos = torch.cos(freqs)  # (seq_len, dim // 2)
-    freqs_sin = torch.sin(freqs)  # (seq_len, dim // 2)
-
-    # Use cat (split layout) instead of repeat_interleave for better memory coalescing
-    # Layout: [cos0, cos1, ..., cos_{d/2-1}, cos0, cos1, ..., cos_{d/2-1}]
-    # This matches mainstream implementations (HuggingFace, Flash Attention) and is GPU-friendly
-    freqs_cos = torch.cat([freqs_cos, freqs_cos], dim=-1)  # (seq_len, dim)
-    freqs_sin = torch.cat([freqs_sin, freqs_sin], dim=-1)  # (seq_len, dim)
-
-    return freqs_cos, freqs_sin
-
-
-def rotate_half(x):
-    """
-    Split x in half and rotate: [x1, x2] -> [-x2, x1]
-    This implements the rotation operation for RoPE using split layout (not interleaved)
-
-    Args:
-        x: (..., dim) where dim is even
-
-    Returns:
-        rotated: (..., dim) with layout [-x_{d/2:d}, x_{0:d/2}]
-    """
-    # Split into two halves
-    x1 = x[..., : x.shape[-1] // 2]  # First half: x_0, x_1, ..., x_{d/2-1}
-    x2 = x[..., x.shape[-1] // 2 :]  # Second half: x_{d/2}, x_{d/2+1}, ..., x_{d-1}
-
-    # Rotate: [-x2, x1]
-    return torch.cat((-x2, x1), dim=-1)
-
 class _attention_pytorch(torch.autograd.Function):
     """
     Plain PyTorch Attention with manual backward pass
