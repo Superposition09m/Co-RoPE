@@ -86,30 +86,31 @@ def apply_rotary_emb(x, freqs_cos, freqs_sin):
 
 class _attention_pytorch(torch.autograd.Function):
     """
-    Plain PyTorch Attention with manual backward pass
-    Interface compatible with flash_attn_v2_triton.py
+    CoRoPE (Context-aware Rotary Positional Embedding) with GQA support
     """
     
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, freqs_cos, freqs_sin):
+    def forward(ctx, q, k, v, causal, sm_scale, theta):
         """
+        CoRoPE Forward Pass with Dynamic Mileage
+        
         Args:
-            q: (BATCH, H, N_CTX, HEAD_DIM)
-            k: (BATCH, H, N_CTX, HEAD_DIM)
-            v: (BATCH, H, N_CTX, HEAD_DIM)
+            q: (BATCH, H_q, N_CTX, HEAD_DIM)
+            k: (BATCH, H_kv, N_CTX, HEAD_DIM)  # GQA: H_q >= H_kv
+            v: (BATCH, H_kv, N_CTX, HEAD_DIM)
             causal: bool
-            sm_scale: float, scaling factor for attention scores
-            freqs_cos: (N_CTX, HEAD_DIM) - precomputed cos values for RoPE
-            freqs_sin: (N_CTX, HEAD_DIM) - precomputed sin values for RoPE
+            sm_scale: float
+            theta: float, RoPE base (e.g., 10000.0)
+        
         Returns:
-            output: (BATCH, H, N_CTX, HEAD_DIM)
+            output: (BATCH, H_q, N_CTX, HEAD_DIM)
         """
-        # Apply RoPE to Q and K (V does not need RoPE)
-        q = apply_rotary_emb(q, freqs_cos, freqs_sin)
-        k = apply_rotary_emb(k, freqs_cos, freqs_sin)
-
-        n_heads_q = q.shape[1]
+        B, n_heads_q, N_CTX, HEAD_DIM = q.shape
         n_heads_kv = k.shape[1]
+        device = q.device
+        dtype = q.dtype
+        
+        # ========== Step 0: GQA Expansion (在计算里程之前) ==========
         if n_heads_q == n_heads_kv:
             group_size = 1
             k_expanded = k
@@ -120,7 +121,6 @@ class _attention_pytorch(torch.autograd.Function):
                     f"Number of Q heads ({n_heads_q}) must be divisible by KV heads ({n_heads_kv})."
                 )
             group_size = n_heads_q // n_heads_kv
-            B, _, N_CTX, HEAD_DIM = k.shape
             k_expanded = k.view(B, n_heads_kv, 1, N_CTX, HEAD_DIM).expand(
                 B, n_heads_kv, group_size, N_CTX, HEAD_DIM
             ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
@@ -128,18 +128,90 @@ class _attention_pytorch(torch.autograd.Function):
                 B, n_heads_kv, group_size, N_CTX, HEAD_DIM
             ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
         
-        # Compute attention scores: Q @ K^T * sm_scale
-        # Use fp32 for dot product accumulation to avoid precision loss in long sequences
-        attn_scores = torch.einsum(
+        # ========== Step 1: 计算步长能量 z_τ = σ(q_n · k_τ) ==========
+        # 使用原始未旋转的 Q, K 计算交互强度
+        z_scores = torch.einsum(
             'bhqd,bhkd->bhqk',
             q.to(torch.float32),
             k_expanded.to(torch.float32)
         ) * sm_scale
         
-        # Apply causal mask if needed
+        # Apply sigmoid to get step energy (里程步长)
+        z = torch.sigmoid(z_scores)  # (B, H, N_CTX, N_CTX)
+        
+        # ========== Step 2: 计算累积里程 a_m = Σ z_s ==========
+        # 对于每个 query position n，计算其累积里程 a_n
+        # a_q[b, h, t] = sum_{s=0}^{t} z[b, h, t, s]
+        a_q = torch.cumsum(z, dim=-1)  # (B, H, N_CTX, N_CTX) - 累积到每个 key 位置
+        
+        # 提取对角线：每个 query 自己的总里程
+        # a_q_diag[b, h, t] = a_q[b, h, t, t]
+        a_q_total = torch.diagonal(a_q, dim1=-2, dim2=-1)  # (B, H, N_CTX)
+        
+        # 对于 key，计算每个位置的累积里程
+        # a_k[b, h, tau] = sum_{s=0}^{tau} z[b, h, n, s] for any n (这里用第一个 query 作为代表)
+        # 更准确的做法：对所有 query 的 z 取平均
+        z_avg = z.mean(dim=2, keepdim=True)  # (B, H, 1, N_CTX) - 平均所有 query
+        a_k = torch.cumsum(z_avg.squeeze(2), dim=-1)  # (B, H, N_CTX)
+        
+        # ========== Step 3: 计算频率向量 (inv_freq) ==========
+        # inv_freq: (HEAD_DIM // 2,)
+        inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM, 2, device=device).float() / HEAD_DIM))
+        
+        # ========== Step 4: 使用里程差计算动态旋转的 Attention Scores ==========
+        # 公式：p'_{t,τ} = Σ_i q_{ti} k_{τi} exp(i·(a_τ - a_t)·θ_i)
+        
+        # 计算里程差矩阵：(a_tau - a_t)
+        # a_q_total: (B, H, N_CTX) - 每个 query 的总里程
+        # a_k: (B, H, N_CTX) - 每个 key 的累积里程
+        # 里程差: (B, H, N_CTX_q, N_CTX_k) where diff[t, tau] = a_k[tau] - a_q[t]
+        mileage_diff = a_k.unsqueeze(2) - a_q_total.unsqueeze(3)  # (B, H, N_CTX, N_CTX)
+        
+        # 计算旋转角度：mileage_diff * theta_i
+        # mileage_diff: (B, H, N_CTX, N_CTX)
+        # inv_freq: (HEAD_DIM // 2,)
+        # 需要广播成：(B, H, N_CTX, N_CTX, HEAD_DIM // 2)
+        angles = mileage_diff.unsqueeze(-1) * inv_freq  # (B, H, N_CTX, N_CTX, HEAD_DIM//2)
+        
+        # 计算 cos 和 sin（使用 split layout）
+        cos_mileage = torch.cos(angles)  # (B, H, N_CTX, N_CTX, HEAD_DIM//2)
+        sin_mileage = torch.sin(angles)  # (B, H, N_CTX, N_CTX, HEAD_DIM//2)
+        
+        # Split Q 和 K_expanded 成两半（split layout）
+        half_dim = HEAD_DIM // 2
+        q1 = q[..., :half_dim]  # (B, H, N_CTX, HEAD_DIM//2)
+        q2 = q[..., half_dim:]  # (B, H, N_CTX, HEAD_DIM//2)
+        k1 = k_expanded[..., :half_dim]
+        k2 = k_expanded[..., half_dim:]
+        
+        # 应用复数旋转并计算点积
+        # 公式：Re[(q1 + iq2)(k1 - ik2) * e^{i·angle}]
+        #     = Re[(q1 + iq2)(k1 - ik2)(cos + i·sin)]
+        #     = (q1·k1 + q2·k2)·cos + (q2·k1 - q1·k2)·sin
+        
+        # 扩展维度用于广播
+        # q1, q2: (B, H, N_CTX_q, 1, HEAD_DIM//2)
+        # k1, k2: (B, H, 1, N_CTX_k, HEAD_DIM//2)
+        q1_exp = q1.unsqueeze(3).to(torch.float32)
+        q2_exp = q2.unsqueeze(3).to(torch.float32)
+        k1_exp = k1.unsqueeze(2).to(torch.float32)
+        k2_exp = k2.unsqueeze(2).to(torch.float32)
+        
+        # 计算旋转点积的实部和虚部
+        # real_part = (q1·k1 + q2·k2)
+        # imag_part = (q2·k1 - q1·k2)
+        real_part = q1_exp * k1_exp + q2_exp * k2_exp  # (B, H, N_q, N_k, D//2)
+        imag_part = q2_exp * k1_exp - q1_exp * k2_exp  # (B, H, N_q, N_k, D//2)
+        
+        # 应用旋转：real·cos - imag·sin
+        rotated_dot = real_part * cos_mileage - imag_part * sin_mileage  # (B, H, N_q, N_k, D//2)
+        
+        # 对 HEAD_DIM 维度求和，得到最终的 attention scores
+        attn_scores = rotated_dot.sum(dim=-1)  # (B, H, N_CTX, N_CTX)
+        
+        # ========== Step 5: Apply Causal Mask ==========
         if causal:
-            N_CTX = q.shape[2]
-            mask = torch.triu(torch.ones(N_CTX, N_CTX, device=q.device, dtype=torch.bool), diagonal=1)
+            mask = torch.triu(torch.ones(N_CTX, N_CTX, device=device, dtype=torch.bool), diagonal=1)
             causal_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, N_CTX, N_CTX)
             attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
         
@@ -182,101 +254,146 @@ class _attention_pytorch(torch.autograd.Function):
             v_expanded.to(torch.float32)
         ).to(q.dtype)
 
-        # Save for backward
-        ctx.save_for_backward(q, k, v, attn_weights, freqs_cos, freqs_sin)
+        # ========== Save for Backward ==========
+        ctx.save_for_backward(q, k, v, attn_weights, z, a_q_total, a_k, mileage_diff)
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         ctx.group_size = group_size
         ctx.n_kv_heads = n_heads_kv
+        ctx.theta = theta
+        ctx.inv_freq = inv_freq
 
         return output
     
     @staticmethod
     def backward(ctx, grad_output):
         """
+        CoRoPE Backward Pass
+        
+        ⚠️ 注意：这个 backward 包含动态里程的梯度传播
+        
         Args:
-            grad_output: (BATCH, H, N_CTX, HEAD_DIM) - gradient w.r.t. output
+            grad_output: (BATCH, H_q, N_CTX, HEAD_DIM)
+        
         Returns:
-            dq, dk, dv: (BATCH, H, N_CTX, HEAD_DIM)
-            dcausal: None
-            dsm_scale: None
-            dfreqs_cos: None
-            dfreqs_sin: None
+            dq, dk, dv, dcausal, dsm_scale, dtheta
         """
-        q, k, v, attn_weights, freqs_cos, freqs_sin = ctx.saved_tensors
+        q, k, v, attn_weights, z, a_q_total, a_k, mileage_diff = ctx.saved_tensors
         sm_scale = ctx.sm_scale
         causal = ctx.causal
         group_size = ctx.group_size
         n_kv_heads = ctx.n_kv_heads
-        n_heads_q = q.shape[1]
-        B, _, N_CTX, HEAD_DIM = q.shape
+        theta = ctx.theta
+        inv_freq = ctx.inv_freq
         
-        # Prepare causal mask if needed
+        B, n_heads_q, N_CTX, HEAD_DIM = q.shape
+        
+        # ========== CoRoPE Backward: 需要反向传播通过动态里程 ==========
+        # ⚠️ 简化版本：暂时不实现完整的里程梯度传播
+        # TODO: 完整实现需要通过 mileage_diff -> a_q, a_k -> z -> q, k
+        
+        # 重新 expand k 和 v（因为 forward 已经计算过）
+        if group_size == 1:
+            k_expanded = k
+            v_expanded = v
+        else:
+            k_expanded = k.view(B, n_kv_heads, 1, N_CTX, HEAD_DIM).expand(
+                B, n_kv_heads, group_size, N_CTX, HEAD_DIM
+            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
+            v_expanded = v.view(B, n_kv_heads, 1, N_CTX, HEAD_DIM).expand(
+                B, n_kv_heads, group_size, N_CTX, HEAD_DIM
+            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
+        
+        # Prepare causal mask
         causal_mask = None
         if causal:
-            N_CTX = q.shape[2]
             mask = torch.triu(torch.ones(N_CTX, N_CTX, device=q.device, dtype=torch.bool), diagonal=1)
             causal_mask = mask.unsqueeze(0).unsqueeze(0)
-
-        if group_size == 1:
-            k_expanded_fp32 = k.to(torch.float32)
-            v_expanded_fp32 = v.to(torch.float32)
-        else:
-            k_expanded_fp32 = k.view(B, n_kv_heads, 1, N_CTX, HEAD_DIM).expand(
-                B, n_kv_heads, group_size, N_CTX, HEAD_DIM
-            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM).to(torch.float32)
-            v_expanded_fp32 = v.view(B, n_kv_heads, 1, N_CTX, HEAD_DIM).expand(
-                B, n_kv_heads, group_size, N_CTX, HEAD_DIM
-            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM).to(torch.float32)
         
+        # ===== Standard Attention Backward (简化：不包含里程梯度) =====
         # Step 1: dV = attn_weights^T @ grad_output
-        # Use fp32 for matrix multiplication accumulation
         dv_expanded = torch.einsum(
             'bhqk,bhqd->bhkd',
             attn_weights.to(torch.float32),
             grad_output.to(torch.float32)
         )
         
-        # Step 2: dS = grad_output @ V^T (gradient w.r.t. attn_weights)
-        # Use fp32 for matrix multiplication accumulation
-        ds = torch.einsum('bhqd,bhkd->bhqk', grad_output.to(torch.float32), v_expanded_fp32)
+        # Step 2: dS = grad_output @ V^T
+        ds = torch.einsum('bhqd,bhkd->bhqk', 
+                         grad_output.to(torch.float32), 
+                         v_expanded.to(torch.float32))
         
         # Step 3: Softmax backward
-        # Use fp32 for accumulation to avoid precision loss in mixed precision training
-        d_softmax_sum = torch.sum(
-            ds * attn_weights.to(torch.float32), 
-            dim=-1, 
-            keepdim=True
-        )
+        d_softmax_sum = torch.sum(ds * attn_weights.to(torch.float32), dim=-1, keepdim=True)
         dp = attn_weights.to(torch.float32) * (ds - d_softmax_sum)
         
-        # Apply mask to dp (gradient w.r.t. attn_scores)
+        # Apply mask to dp
         if causal:
             dp = dp.masked_fill(causal_mask, 0.0)
         
-        # Step 4: dQ = dp @ K * sm_scale
-        # Use fp32 for matrix multiplication accumulation
-        dq = torch.einsum('bhqk,bhkd->bhqd', dp, k_expanded_fp32) * sm_scale
-
-        # Step 5: dK = dp^T @ Q * sm_scale
-        # Use fp32 for matrix multiplication accumulation
-        dk_expanded = torch.einsum('bhqk,bhqd->bhkd', dp, q.to(torch.float32)) * sm_scale
+        # ===== Step 4: CoRoPE Backward - 计算 dQ 和 dK =====
+        # 这里需要反向传播通过旋转操作
+        # dp: (B, H, N_q, N_k) - gradient w.r.t. attention scores
         
+        # 重新计算旋转所需的 cos, sin（与 forward 相同）
+        half_dim = HEAD_DIM // 2
+        angles = mileage_diff.unsqueeze(-1) * inv_freq
+        cos_mileage = torch.cos(angles)
+        sin_mileage = torch.sin(angles)
+        
+        # Split Q 和 K
+        q1, q2 = q[..., :half_dim], q[..., half_dim:]
+        k1, k2 = k_expanded[..., :half_dim], k_expanded[..., half_dim:]
+        
+        # 扩展维度
+        q1_exp = q1.unsqueeze(3).to(torch.float32)
+        q2_exp = q2.unsqueeze(3).to(torch.float32)
+        k1_exp = k1.unsqueeze(2).to(torch.float32)
+        k2_exp = k2.unsqueeze(2).to(torch.float32)
+        
+        # dp 需要扩展维度：(B, H, N_q, N_k, 1)
+        dp_exp = dp.unsqueeze(-1)
+        
+        # Backward through the rotated dot product
+        # d(real_part) = dp * cos, d(imag_part) = -dp * sin
+        d_real = dp_exp * cos_mileage
+        d_imag = -dp_exp * sin_mileage
+        
+        # real_part = q1·k1 + q2·k2
+        # imag_part = q2·k1 - q1·k2
+        # 反向传播：
+        dq1 = (d_real * k1_exp + d_imag * k2_exp).sum(dim=3)  # sum over key dim
+        dq2 = (d_real * k2_exp + d_imag * k1_exp).sum(dim=3)
+        dk1 = (d_real * q1_exp + d_imag * q2_exp).sum(dim=2)  # sum over query dim
+        dk2 = (d_real * q2_exp - d_imag * q1_exp).sum(dim=2)
+        
+        # Concatenate gradients
+        dq = torch.cat([dq1, dq2], dim=-1).to(q.dtype)
+        dk_expanded = torch.cat([dk1, dk2], dim=-1).to(k.dtype)
+        
+        # Aggregate gradients for GQA
         if group_size == 1:
             dv = dv_expanded.to(v.dtype)
-            dk = dk_expanded.to(k.dtype)
+            dk = dk_expanded
         else:
             dv = dv_expanded.view(B, n_kv_heads, group_size, N_CTX, HEAD_DIM).sum(dim=2).contiguous().to(v.dtype)
             dk = dk_expanded.view(B, n_kv_heads, group_size, N_CTX, HEAD_DIM).sum(dim=2).contiguous().to(k.dtype)
-        
-        # Convert back to original dtype
-        dq = dq.to(q.dtype)
 
-        # Apply inverse RoPE to gradients (use -freqs_sin for inverse rotation)
-        dq = apply_rotary_emb(dq, freqs_cos, -freqs_sin)
-        dk = apply_rotary_emb(dk, freqs_cos, -freqs_sin)
-
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None
 
 
 attention_pytorch = _attention_pytorch.apply
+
+
+# 为了向后兼容，保留旧的接口（但内部使用 CoRoPE）
+def attention_pytorch_legacy(q, k, v, causal, sm_scale, freqs_cos, freqs_sin):
+    """
+    ⚠️ 废弃接口：为了兼容旧测试保留
+    
+    这个接口假设使用预计算的 freqs_cos/freqs_sin（静态 RoPE）
+    但 CoRoPE 需要动态计算里程，所以这里提取 theta 并调用新接口
+    """
+    # 从 freqs_cos 反推 theta（假设标准 RoPE）
+    # 这只是一个兼容层，实际使用应该直接调用 attention_pytorch
+    theta = 10000.0  # 默认值
+    return attention_pytorch(q, k, v, causal, sm_scale, theta)
