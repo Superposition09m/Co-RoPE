@@ -4,8 +4,11 @@ Fused CoRoPE Attention (GQA Skeleton)
 
 This module carries the Triton kernel backbone for the CoRoPE-GQA fused
 attention path.  Step 1 focuses on locking down the CTA scheduling,
-per-group Q loading, and the public Python interface (no more static
-cos/sin tables – only `inv_freq`).
+per-group Q loading, and the public Python interface.
+
+Interface: attention(q, k, v, causal, sm_scale, theta)
+- theta: RoPE base frequency (e.g., 10000.0), same as PyTorch version
+- inv_freq is computed internally from theta
 """
 
 import pytest
@@ -76,34 +79,17 @@ def _corope_fwd_backbone(
 
     inv_idx = tl.arange(0, half_dim)
     inv_freq = tl.load(inv_freq_ptr + inv_idx * stride_inv, mask=inv_idx < half_dim, other=0.0).to(tl.float32)
-    inv_freq = inv_freq
 
-    q1_group = []
-    q2_group = []
-
-    q_dtype = tl.float16
-    for g in range(GROUP_SIZE):
-        head_idx = head_base + g
-        if head_idx >= H_Q:
-            break
-
-        q_head_base = Q + off_z * stride_qz + head_idx * stride_qh
-        q_head_base = tl.multiple_of(q_head_base, 16)
-
-        q1_ptrs = q_head_base + offs_m[:, None] * stride_qm + offs_d_first[None, :] * stride_qk
-        q2_ptrs = q_head_base + offs_m[:, None] * stride_qm + offs_d_second[None, :] * stride_qk
-
-        q1_raw = tl.load(q1_ptrs, mask=mask_q, other=0.0)
-        q2_raw = tl.load(q2_ptrs, mask=mask_q, other=0.0)
-
-        if g == 0:
-            q_dtype = q1_raw.dtype
-
-        q1_group.append(q1_raw.to(tl.float32))
-        q2_group.append(q2_raw.to(tl.float32))
-
-    leader_q1 = q1_group[0]
-    leader_q2 = q2_group[0]
+    # 领航员预计算：独立加载 Leader (第一个 head)
+    leader_head_idx = head_base
+    leader_q_base = Q + off_z * stride_qz + leader_head_idx * stride_qh
+    leader_q_base = tl.multiple_of(leader_q_base, 16)
+    
+    leader_q1_ptrs = leader_q_base + offs_m[:, None] * stride_qm + offs_d_first[None, :] * stride_qk
+    leader_q2_ptrs = leader_q_base + offs_m[:, None] * stride_qm + offs_d_second[None, :] * stride_qk
+    
+    leader_q1 = tl.load(leader_q1_ptrs, mask=mask_q, other=0.0).to(tl.float32)
+    leader_q2 = tl.load(leader_q2_ptrs, mask=mask_q, other=0.0).to(tl.float32)
 
     half_dim_range = tl.arange(0, half_dim)
     km_off = half_dim_range
@@ -112,12 +98,15 @@ def _corope_fwd_backbone(
     V_base = V + off_z * stride_vz + off_kv * stride_vh
     V_base = tl.multiple_of(V_base, 16)
 
+    # Stage-1: 向量化计算全局里程 a_tt
+    # 使用 leader Q 扫描所有 K，计算每个 Q token 的最终里程值
     a_tt = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     for start_n in tl.range(0, N_CTX, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N_CTX
 
+        # 加载 K tile: (BLOCK_N, half_dim)
         k1_tile = tl.load(
             K_base + offs_n[:, None] * stride_km + km_off[None, :] * stride_kk,
             mask=mask_n[:, None] & col_mask,
@@ -129,40 +118,74 @@ def _corope_fwd_backbone(
             other=0.0,
         ).to(tl.float32)
 
-        for nn in range(BLOCK_N):
-            k_index = start_n + nn
-            if k_index >= N_CTX:
-                break
+        # 向量化计算能量矩阵: (BLOCK_M, BLOCK_N)
+        # E_A = Q1 @ K1^T + Q2 @ K2^T
+        ea_tile = tl.dot(leader_q1, tl.trans(k1_tile)) + tl.dot(leader_q2, tl.trans(k2_tile))
+        ea_tile = ea_tile * sm_scale
+        
+        # Sigmoid: z = 1 / (1 + exp(-ea))
+        z_tile = 1.0 / (1.0 + tl.exp(-ea_tile))
+        
+        # Causal mask: offs_m[:, None] >= offs_n[None, :]
+        causal_mask = offs_m[:, None] >= offs_n[None, :]
+        valid_mask = causal_mask & mask_m[:, None] & mask_n[None, :]
+        z_tile = tl.where(valid_mask, z_tile, 0.0)
+        
+        # 行求和更新全局里程: a_tt += sum(z_tile, axis=1)
+        a_tt += tl.sum(z_tile, axis=1)
 
-            k1_vec = k1_tile[nn]
-            k2_vec = k2_tile[nn]
-
-            ea_leader = leader_q1 * k1_vec[None, :] + leader_q2 * k2_vec[None, :]
-            dot = tl.sum(ea_leader, axis=1) * sm_scale
-            z = 1.0 / (1.0 + tl.exp(-dot))
-
-            causal_mask = (offs_m >= k_index)
-            z = tl.where(causal_mask & mask_m, z, 0.0)
-            a_tt += z
-
-    num_loaded = len(q1_group)
-    acc_list_first = []
-    acc_list_second = []
-    m_list = []
-    l_list = []
-
-    for _ in range(num_loaded):
-        acc_list_first.append(tl.zeros([BLOCK_M, half_dim], dtype=tl.float32))
-        acc_list_second.append(tl.zeros([BLOCK_M, half_dim], dtype=tl.float32))
-        m_list.append(tl.zeros([BLOCK_M], dtype=tl.float32))
-        l_list.append(tl.zeros([BLOCK_M], dtype=tl.float32))
-
+    # Stage-2: 为每个 group 独立分配状态变量
+    # 关键：不用大向量索引，而是用独立变量 + 条件更新
+    
+    # 为最多 8 个 group 预分配状态（GROUP_SIZE <= 8）
+    acc_first_0 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_0 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_0 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_0 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    acc_first_1 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_1 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_1 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_1 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    acc_first_2 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_2 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_2 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_2 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    acc_first_3 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_3 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_3 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_3 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    acc_first_4 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_4 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_4 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_4 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    acc_first_5 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_5 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_5 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_5 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    acc_first_6 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_6 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_6 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_6 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    acc_first_7 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    acc_second_7 = tl.zeros([BLOCK_M, half_dim], dtype=tl.float32)
+    m_7 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_7 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    # Leader 里程累积
     acc_z = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     for start_n in tl.range(0, N_CTX, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N_CTX
 
+        # 加载共享的 K, V
         k1_tile = tl.load(
             K_base + offs_n[:, None] * stride_km + km_off[None, :] * stride_kk,
             mask=mask_n[:, None] & col_mask,
@@ -185,105 +208,215 @@ def _corope_fwd_backbone(
             other=0.0,
         ).to(tl.float32)
 
-        block_cumsum = tl.zeros([BLOCK_M], dtype=tl.float32)
-
-        for nn in range(BLOCK_N):
-            k_index = start_n + nn
-            if k_index >= N_CTX:
-                break
-
-            k1_vec = k1_tile[nn]
-            k2_vec = k2_tile[nn]
-            v1_vec = v1_tile[nn]
-            v2_vec = v2_tile[nn]
-
-            ea_leader = leader_q1 * k1_vec[None, :] + leader_q2 * k2_vec[None, :]
-            dot_leader = tl.sum(ea_leader, axis=1) * sm_scale
-            z = 1.0 / (1.0 + tl.exp(-dot_leader))
-
-            causal_mask = (offs_m >= k_index)
-            valid_mask = causal_mask & mask_m
-            z = tl.where(valid_mask, z, 0.0)
-
-            block_cumsum += z
-            a_block = acc_z + block_cumsum
-            delta = a_tt - a_block
-
-            phi = delta[:, None] * inv_freq[None, :]
+        # Leader 里程计算
+        ea_leader = tl.dot(leader_q1, tl.trans(k1_tile)) + tl.dot(leader_q2, tl.trans(k2_tile))
+        ea_leader = ea_leader * sm_scale
+        z_tile = 1.0 / (1.0 + tl.exp(-ea_leader))
+        
+        causal_mask = offs_m[:, None] >= offs_n[None, :]
+        valid_mask = causal_mask & mask_m[:, None] & mask_n[None, :]
+        z_tile = tl.where(valid_mask, z_tile, 0.0)
+        
+        # 块内动态里程
+        z_cumsum = tl.cumsum(z_tile, axis=1)
+        a_block_tile = acc_z[:, None] + z_cumsum
+        delta_tile = a_tt[:, None] - a_block_tile
+        
+        # 静态循环展开：为每个 group 成员计算 attention
+        for g in tl.static_range(GROUP_SIZE):
+            head_idx = head_base + g
+            head_mask = head_idx < H_Q
+            
+            # 加载当前 group 的 Q
+            q_head_base = Q + off_z * stride_qz + head_idx * stride_qh
+            q_head_base = tl.multiple_of(q_head_base, 16)
+            
+            q1_ptrs = q_head_base + offs_m[:, None] * stride_qm + offs_d_first[None, :] * stride_qk
+            q2_ptrs = q_head_base + offs_m[:, None] * stride_qm + offs_d_second[None, :] * stride_qk
+            
+            q1 = tl.load(q1_ptrs, mask=mask_q & head_mask, other=0.0).to(tl.float32)
+            q2 = tl.load(q2_ptrs, mask=mask_q & head_mask, other=0.0).to(tl.float32)
+            
+            # Co-RoPE 相位校准：使用 3D broadcasting
+            # 相位: phi = delta[:, :, None] * inv_freq[None, None, :]
+            phi = delta_tile[:, :, None] * inv_freq[None, None, :]  # (BLOCK_M, BLOCK_N, half_dim)
             cos_phi = tl.cos(phi)
             sin_phi = tl.sin(phi)
+            
+            # 能量矩阵: (BLOCK_M, BLOCK_N, half_dim)
+            ea = q1[:, None, :] * k1_tile[None, :, :] + q2[:, None, :] * k2_tile[None, :, :]
+            eb = q2[:, None, :] * k1_tile[None, :, :] - q1[:, None, :] * k2_tile[None, :, :]
+            
+            # 相位校准后求和: (BLOCK_M, BLOCK_N)
+            score = tl.sum(ea * cos_phi - eb * sin_phi, axis=2)
+            
+            # 应用 scale 和 mask
+            score = score * sm_scale
+            score = tl.where(valid_mask & head_mask, score, -float('inf'))
+            
+            # Online softmax - 根据 g 值更新对应的状态变量
+            m_curr = tl.max(score, axis=1)
+            
+            # 展开：为每个 g 值分别处理
+            if g == 0:
+                m_new = tl.maximum(m_0, m_curr)
+                alpha = tl.exp(m_0 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_0 = l_0 * alpha + tl.sum(p, axis=1)
+                acc_first_0 = acc_first_0 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_0 = acc_second_0 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_0 = m_new
+            if g == 1:
+                m_new = tl.maximum(m_1, m_curr)
+                alpha = tl.exp(m_1 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_1 = l_1 * alpha + tl.sum(p, axis=1)
+                acc_first_1 = acc_first_1 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_1 = acc_second_1 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_1 = m_new
+            if g == 2:
+                m_new = tl.maximum(m_2, m_curr)
+                alpha = tl.exp(m_2 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_2 = l_2 * alpha + tl.sum(p, axis=1)
+                acc_first_2 = acc_first_2 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_2 = acc_second_2 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_2 = m_new
+            if g == 3:
+                m_new = tl.maximum(m_3, m_curr)
+                alpha = tl.exp(m_3 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_3 = l_3 * alpha + tl.sum(p, axis=1)
+                acc_first_3 = acc_first_3 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_3 = acc_second_3 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_3 = m_new
+            if g == 4:
+                m_new = tl.maximum(m_4, m_curr)
+                alpha = tl.exp(m_4 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_4 = l_4 * alpha + tl.sum(p, axis=1)
+                acc_first_4 = acc_first_4 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_4 = acc_second_4 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_4 = m_new
+            if g == 5:
+                m_new = tl.maximum(m_5, m_curr)
+                alpha = tl.exp(m_5 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_5 = l_5 * alpha + tl.sum(p, axis=1)
+                acc_first_5 = acc_first_5 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_5 = acc_second_5 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_5 = m_new
+            if g == 6:
+                m_new = tl.maximum(m_6, m_curr)
+                alpha = tl.exp(m_6 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_6 = l_6 * alpha + tl.sum(p, axis=1)
+                acc_first_6 = acc_first_6 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_6 = acc_second_6 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_6 = m_new
+            if g == 7:
+                m_new = tl.maximum(m_7, m_curr)
+                alpha = tl.exp(m_7 - m_new)
+                p = tl.exp(score - m_new[:, None])
+                p = tl.where(valid_mask & head_mask, p, 0.0)
+                l_7 = l_7 * alpha + tl.sum(p, axis=1)
+                acc_first_7 = acc_first_7 * alpha[:, None] + tl.dot(p, v1_tile)
+                acc_second_7 = acc_second_7 * alpha[:, None] + tl.dot(p, v2_tile)
+                m_7 = m_new
+        
+        acc_z += tl.sum(z_tile, axis=1)
 
-            for g in range(num_loaded):
-                q1 = q1_group[g]
-                q2 = q2_group[g]
-
-                ea = q1 * k1_vec[None, :] + q2 * k2_vec[None, :]
-                eb = q2 * k1_vec[None, :] - q1 * k2_vec[None, :]
-
-                score = tl.sum(ea * cos_phi - eb * sin_phi, axis=1) * sm_scale
-                score = tl.where(valid_mask, score, -float('inf'))
-
-                acc_first = acc_list_first[g]
-                acc_second = acc_list_second[g]
-                m_prev = m_list[g]
-                l_prev = l_list[g]
-
-                m_new = tl.maximum(m_prev, score)
-                alpha = tl.exp(m_prev - m_new)
-                p = tl.exp(score - m_new)
-
-                alpha = tl.where(mask_m, alpha, 0.0)
-                p = tl.where(valid_mask, p, 0.0)
-
-                l_new = l_prev * alpha + p
-                acc_first = acc_first * alpha[:, None] + p[:, None] * v1_vec[None, :]
-                acc_second = acc_second * alpha[:, None] + p[:, None] * v2_vec[None, :]
-
-                acc_list_first[g] = acc_first
-                acc_list_second[g] = acc_second
-                m_list[g] = m_new
-                l_list[g] = l_new
-
-        acc_z += block_cumsum
-
-    for g in range(num_loaded):
+    # 归一化并写回：为每个 group 独立处理
+    for g in tl.static_range(GROUP_SIZE):
         head_idx = head_base + g
+        head_mask_g = head_idx < H_Q
+        
+        # 根据 g 选择对应的状态变量
+        if g == 0:
+            safe_l = tl.maximum(l_0, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_0 > 0.0, inv_l, 0.0)
+            out_first = acc_first_0 * inv_l[:, None]
+            out_second = acc_second_0 * inv_l[:, None]
+        if g == 1:
+            safe_l = tl.maximum(l_1, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_1 > 0.0, inv_l, 0.0)
+            out_first = acc_first_1 * inv_l[:, None]
+            out_second = acc_second_1 * inv_l[:, None]
+        if g == 2:
+            safe_l = tl.maximum(l_2, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_2 > 0.0, inv_l, 0.0)
+            out_first = acc_first_2 * inv_l[:, None]
+            out_second = acc_second_2 * inv_l[:, None]
+        if g == 3:
+            safe_l = tl.maximum(l_3, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_3 > 0.0, inv_l, 0.0)
+            out_first = acc_first_3 * inv_l[:, None]
+            out_second = acc_second_3 * inv_l[:, None]
+        if g == 4:
+            safe_l = tl.maximum(l_4, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_4 > 0.0, inv_l, 0.0)
+            out_first = acc_first_4 * inv_l[:, None]
+            out_second = acc_second_4 * inv_l[:, None]
+        if g == 5:
+            safe_l = tl.maximum(l_5, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_5 > 0.0, inv_l, 0.0)
+            out_first = acc_first_5 * inv_l[:, None]
+            out_second = acc_second_5 * inv_l[:, None]
+        if g == 6:
+            safe_l = tl.maximum(l_6, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_6 > 0.0, inv_l, 0.0)
+            out_first = acc_first_6 * inv_l[:, None]
+            out_second = acc_second_6 * inv_l[:, None]
+        if g == 7:
+            safe_l = tl.maximum(l_7, 1e-9)
+            inv_l = 1.0 / safe_l
+            inv_l = tl.where(l_7 > 0.0, inv_l, 0.0)
+            out_first = acc_first_7 * inv_l[:, None]
+            out_second = acc_second_7 * inv_l[:, None]
+        
+        # 构建输出指针并存储
         o_head_base = O + off_z * stride_oz + head_idx * stride_oh
         o_head_base = tl.multiple_of(o_head_base, 16)
-
+        
         o_half0 = o_head_base + offs_m[:, None] * stride_om + offs_d_first[None, :] * stride_ok
         o_half1 = o_head_base + offs_m[:, None] * stride_om + offs_d_second[None, :] * stride_ok
-
-        acc_first = acc_list_first[g]
-        acc_second = acc_list_second[g]
-        l_final = l_list[g]
-        safe_l = tl.maximum(l_final, 1e-9)
-        inv_l = 1.0 / safe_l
-        inv_l = tl.where(l_final > 0.0, inv_l, 0.0)
-
-        out_first = acc_first * inv_l[:, None]
-        out_second = acc_second * inv_l[:, None]
-
-        tl.store(o_half0, out_first.to(q_dtype), mask=mask_q)
-        tl.store(o_half1, out_second.to(q_dtype), mask=mask_q)
+        
+        # 存储（用 mask 控制是否有效）
+        tl.store(o_half0, out_first.to(tl.float16), mask=mask_q & head_mask_g)
+        tl.store(o_half1, out_second.to(tl.float16), mask=mask_q & head_mask_g)
 
 
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, inv_freq, warp_specialize=True):
+    def forward(ctx, q, k, v, causal, sm_scale, theta, warp_specialize=False):
         if not causal:
             raise ValueError("CoRoPE fused kernel supports causal=True only.")
 
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("Expected q, k, v to have shape (batch, heads, seqlen, dim).")
 
-        if q.shape != v.shape:
-            raise ValueError("q and v must share the same shape for fused attention.")
+        if k.shape != v.shape:
+            raise ValueError("k and v must share the same shape in GQA.")
         if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2] or q.shape[3] != k.shape[3]:
             raise ValueError("k must align with q along batch/sequence/head_dim.")
 
         BATCH, H_Q, N_CTX, HEAD_DIM = q.shape
+        device = q.device
         H_KV = k.shape[1]
         if H_Q % H_KV != 0:
             raise ValueError("Number of query heads must be divisible by KV heads.")
@@ -291,12 +424,8 @@ class _attention(torch.autograd.Function):
         if group_size > 8:
             raise ValueError(f"CoRoPE backbone currently limits group_size <= 8 (got {group_size}).")
 
-        if inv_freq.ndim != 1:
-            raise ValueError("inv_freq must be a 1D tensor of length head_dim/2.")
-        if inv_freq.shape[0] != HEAD_DIM // 2:
-            raise ValueError("inv_freq length must equal head_dim // 2.")
-        if inv_freq.device != q.device:
-            raise ValueError("inv_freq must reside on the same device as q.")
+        # Compute RoPE frequencies dynamically (same as PyTorch version)
+        inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM, 2, device=device).float() / HEAD_DIM))
 
         o = torch.empty_like(q)
 
@@ -316,6 +445,8 @@ class _attention(torch.autograd.Function):
             BLOCK_M=DEFAULT_BLOCK_M,
             BLOCK_N=DEFAULT_BLOCK_N,
             GROUP_SIZE=group_size,
+            num_warps=4,
+            num_stages=1,
         )
 
         ctx.save_for_backward(q, k, v, inv_freq)
@@ -405,7 +536,6 @@ class _attention(torch.autograd.Function):
         dphi = -sin_phi * dcos + cos_phi * dsin
 
         d_delta = (dphi * inv).sum(dim=-1)
-        d_inv = (dphi * delta.unsqueeze(-1)).sum(dim=(0, 1, 2, 3))
 
         # Gradients from trigonometric expansion into Q/K
         dq1 = (dE_A * k1.unsqueeze(-3)).sum(dim=-2) - (dE_B * k2.unsqueeze(-3)).sum(dim=-2)
@@ -443,10 +573,8 @@ class _attention(torch.autograd.Function):
         dq = dq_total.to(q.dtype).contiguous()
         dk = dk_total.to(k.dtype).contiguous()
         dv = dv.to(v.dtype).contiguous()
-        d_inv = d_inv.to(inv_freq.dtype).contiguous()
-        dsm_scale = torch.tensor(dsm_scale, device=device, dtype=torch.float32)
 
-        return dq, dk, dv, None, dsm_scale, d_inv, None
+        return dq, dk, dv, None, None, None, None
 
 
 attention = _attention.apply
@@ -471,9 +599,8 @@ def test_q_loading_backbone(Z, H_KV, GROUP_SIZE, N_CTX, HEAD_DIM, dtype=torch.fl
     v = torch.randn((Z, H_KV, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype)
 
     theta = 10000.0
-    inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM, 2, device=DEVICE, dtype=torch.float32) / HEAD_DIM))
 
-    out = attention(q, k, v, causal=True, sm_scale=1.0, inv_freq=inv_freq)
+    out = attention(q, k, v, causal=True, sm_scale=1.0, theta=theta)
 
     q_view = q.reshape(Z, H_KV, GROUP_SIZE, N_CTX, HEAD_DIM)
     o_view = out.reshape(Z, H_KV, GROUP_SIZE, N_CTX, HEAD_DIM)

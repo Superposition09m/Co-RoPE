@@ -25,6 +25,9 @@ class _attention_pytorch(torch.autograd.Function):
         Returns:
             output: (BATCH, H, N_CTX, HEAD_DIM)
         """
+        if not causal:
+            raise ValueError("CoRoPE PyTorch implementation supports causal=True only.")
+        
         B, n_heads_q, N_CTX, HEAD_DIM = q.shape
         device = q.device
 
