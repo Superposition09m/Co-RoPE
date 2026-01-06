@@ -62,9 +62,18 @@ def forward_literal(ctx, q, k, v, causal, sm_scale, theta):
             B, n_heads_kv, group_size, N_CTX, HEAD_DIM
         ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
     
-    z = torch.sigmoid(torch.einsum('bhqd,bhkd->bhqk', q, k_expanded) * sm_scale)
-    a = torch.cumsum(z, dim=-1)
+    # --- Co-RoPE Leader-Driven Logic: BEGIN ---
+    # 1. 采样领航头：每 group_size 个头取一个 (Repeat Interleave 布局下首位即领航员)
+    q_leaders = q[:, ::group_size, :, :] # (B, H_kv, N, D)
+    
+    # 2. 计算组共享里程 (计算量缩小至 1/group_size)
+    z_leader = torch.sigmoid(torch.einsum('bhqd,bhkd->bhqk', q_leaders, k) * sm_scale)
+    a_leader = torch.cumsum(z_leader, dim=-1)
+    
+    # 3. 驱动全组：广播里程分布
+    a = a_leader.repeat_interleave(group_size, dim=1) # (B, H_q, N, N)
     a_tt = torch.diagonal(a, dim1=-2, dim2=-1).unsqueeze(-1)
+    # --- Co-RoPE Leader-Driven Logic: END ---
     
     q_phi = a_tt * inv_freq.view(1, 1, 1, -1).repeat(1, 1, 1, 2)
     q = q * torch.cos(q_phi) + rotate_half(q) * torch.sin(q_phi)
@@ -171,9 +180,16 @@ def forward_calibrated(ctx, q, k, v, causal, sm_scale, theta):
             B, n_heads_kv, group_size, N_CTX, HEAD_DIM
         ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
     
-    z = torch.sigmoid(torch.einsum('bhqd,bhkd->bhqk', q, k_expanded) * sm_scale)
-    a = torch.cumsum(z, dim=-1)
+    # --- Co-RoPE Leader-Driven Logic: BEGIN ---
+    # 1. 采样领航头并计算组共享里程
+    q_leaders = q[:, ::group_size, :, :]
+    z_leader = torch.sigmoid(torch.einsum('bhqd,bhkd->bhqk', q_leaders, k) * sm_scale)
+    a_leader = torch.cumsum(z_leader, dim=-1)
+    
+    # 2. 广播里程分布并计算里程差 delta_a
+    a = a_leader.repeat_interleave(group_size, dim=1)
     delta_a = torch.diagonal(a, dim1=-2, dim2=-1).unsqueeze(-1) - a
+    # --- Co-RoPE Leader-Driven Logic: END ---
     
     d_half = HEAD_DIM // 2
     q1, q2 = q[..., :d_half], q[..., d_half:]

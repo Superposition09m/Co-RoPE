@@ -50,9 +50,16 @@ class _attention_pytorch(torch.autograd.Function):
                 B, n_heads_kv, group_size, N_CTX, HEAD_DIM
             ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
         
-        z = torch.sigmoid(torch.einsum('bhqd,bhkd->bhqk', q, k_expanded) * sm_scale)
-        a = torch.cumsum(z, dim=-1)
+        # --- Co-RoPE Leader-Driven Logic: BEGIN ---
+        # 1. 采样领航头并计算组共享里程
+        q_leaders = q[:, ::group_size, :, :]
+        z_leader = torch.sigmoid(torch.einsum('bhqd,bhkd->bhqk', q_leaders, k) * sm_scale)
+        a_leader = torch.cumsum(z_leader, dim=-1)
+        
+        # 2. 广播里程分布并计算里程差 delta_a
+        a = a_leader.repeat_interleave(group_size, dim=1)
         delta_a = torch.diagonal(a, dim1=-2, dim2=-1).unsqueeze(-1) - a
+        # --- Co-RoPE Leader-Driven Logic: END ---
         
         d_half = HEAD_DIM // 2
         q1, q2 = q[..., :d_half], q[..., d_half:]
@@ -113,13 +120,13 @@ class _attention_pytorch(torch.autograd.Function):
             v_expanded.to(torch.float32)
         ).to(q.dtype)
 
-
-        ctx.save_for_backward(q, k, v, attn_weights)
-        ctx.sm_scale = sm_scale
-        ctx.causal = causal
-        ctx.group_size = group_size
-        ctx.n_kv_heads = n_heads_kv
-        ctx.theta = theta
+        if ctx is not None:
+            ctx.save_for_backward(q, k, v, attn_weights)
+            ctx.sm_scale = sm_scale
+            ctx.causal = causal
+            ctx.group_size = group_size
+            ctx.n_kv_heads = n_heads_kv
+            ctx.theta = theta
 
         return output
 
@@ -193,10 +200,12 @@ class _attention_pytorch(torch.autograd.Function):
             theta ** (torch.arange(0, HEAD_DIM, 2, device=device).float() / HEAD_DIM)
         )
 
-        raw_dot = torch.einsum("bhqd,bhkd->bhqk", q_fp32, k_expanded_fp32)
-        pre_sigmoid = raw_dot * sm_scale
-        z = torch.sigmoid(pre_sigmoid)
-        a = torch.cumsum(z, dim=-1)
+        # --- Leader-Driven Co-RoPE: 重新计算里程（与 forward 对齐）---
+        q_leaders_fp32 = q_fp32[:, ::group_size, :, :]  # (B, n_kv_heads, N, D)
+        raw_dot_leader = torch.einsum("bhqd,bhkd->bhqk", q_leaders_fp32, k_fp32)
+        z_leader = torch.sigmoid(raw_dot_leader * sm_scale)
+        a_leader = torch.cumsum(z_leader, dim=-1)
+        a = a_leader.repeat_interleave(group_size, dim=1)  # 广播到全组
         diag_a = torch.diagonal(a, dim1=-2, dim2=-1)
         delta_a = diag_a.unsqueeze(-1) - a
 
@@ -239,20 +248,25 @@ class _attention_pytorch(torch.autograd.Function):
         g_diag_a = g_delta.sum(dim=-1)
         g_a = torch.diag_embed(g_diag_a) - g_delta
 
-        g_z = torch.cumsum(g_a.flip(-1), dim=-1).flip(-1)
-        g_pre_sigmoid = g_z * z * (1.0 - z)
-        g_raw_dot = g_pre_sigmoid * sm_scale
+        # --- Leader-Driven Gradient: 聚合组内梯度到领航头 ---
+        g_a_leader = g_a.view(B, n_kv_heads, group_size, N_CTX, N_CTX).sum(dim=2)
+        g_z_leader = torch.cumsum(g_a_leader.flip(-1), dim=-1).flip(-1)
+        g_pre_sigmoid_leader = g_z_leader * z_leader * (1.0 - z_leader)
+        g_raw_dot_leader = g_pre_sigmoid_leader * sm_scale
 
-        dq_from_raw = torch.einsum("bhqk,bhkd->bhqd", g_raw_dot, k_expanded_fp32)
-        dk_from_raw = torch.einsum("bhqk,bhqd->bhkd", g_raw_dot, q_fp32)
+        # 梯度传回领航头 Q 和原始 K
+        dq_from_raw = torch.zeros_like(q_fp32)
+        dq_from_raw[:, ::group_size, :, :] = torch.einsum("bhqk,bhkd->bhqd", g_raw_dot_leader, k_fp32)
+        dk_from_raw = torch.einsum("bhqk,bhqd->bhkd", g_raw_dot_leader, q_leaders_fp32)
 
         dq_fp32 = dq_from_raw
         dq_fp32[..., :d_half] += dq1_from_EA + dq1_from_EB
         dq_fp32[..., d_half:] += dq2_from_EA + dq2_from_EB
 
-        dk_expanded_fp32 = dk_from_raw
-        dk_expanded_fp32[..., :d_half] += dk1_from_EA + dk1_from_EB
-        dk_expanded_fp32[..., d_half:] += dk2_from_EA + dk2_from_EB
+        # dk_from_raw 现在是 (B, n_kv_heads, N, D)，需要先累加能量场梯度
+        dk_expanded_fp32 = torch.zeros_like(k_expanded_fp32)
+        dk_expanded_fp32[..., :d_half] = dk1_from_EA + dk1_from_EB
+        dk_expanded_fp32[..., d_half:] = dk2_from_EA + dk2_from_EB
 
         if needs_dq:
             dq = dq_fp32.to(q.dtype)
@@ -260,15 +274,10 @@ class _attention_pytorch(torch.autograd.Function):
             dq = None
 
         if needs_dk:
-            if group_size == 1:
-                dk = dk_expanded_fp32.to(k.dtype)
-            else:
-                dk = (
-                    dk_expanded_fp32.view(B, n_kv_heads, group_size, N_CTX, HEAD_DIM)
-                    .sum(dim=2)
-                    .contiguous()
-                    .to(k.dtype)
-                )
+            # 聚合能量场梯度（从 k_expanded 回到原始 k）
+            dk_from_energy = dk_expanded_fp32.view(B, n_kv_heads, group_size, N_CTX, HEAD_DIM).sum(dim=2)
+            # 加上里程梯度
+            dk = (dk_from_raw + dk_from_energy).contiguous().to(k.dtype)
         else:
             dk = None
 
@@ -289,3 +298,63 @@ class _attention_pytorch(torch.autograd.Function):
 
 
 attention_pytorch = _attention_pytorch.apply
+
+if __name__ == "__main__":
+    import torch
+    torch.manual_seed(42)
+    
+    B, H, N, D = 2, 4, 64, 32
+    sm_scale = D ** -0.5
+    theta = 10000.0
+    causal = True
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float32 # 先用 fp32 排除精度干扰
+
+    print(f"🔬 Starting Co-RoPE Bwd vs Autograd Verification")
+    
+    # 准备输入
+    q = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(B, H // 2, N, D, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(B, H // 2, N, D, device=device, dtype=dtype, requires_grad=True)
+
+    # 1. 前向验证（两者应该完全相同，因为 forward 逻辑相同）
+    out_manual = attention_pytorch(q, k, v, causal, sm_scale, theta)
+    # 直接复用 forward，绕过 custom backward（ctx=None 让 Autograd 接管）
+    out_ref = _attention_pytorch.forward(None, q, k, v, causal, sm_scale, theta)
+    
+    fwd_diff = (out_manual - out_ref).abs().max().item()
+    print(f"✅ Forward Max Diff: {fwd_diff:.2e}")
+
+    # 2. 梯度验证
+    # 计算参考梯度 (Autograd 真理)
+    loss_ref = out_ref.sum()
+    loss_ref.backward()
+    grad_q_ref, grad_k_ref, grad_v_ref = q.grad.clone(), k.grad.clone(), v.grad.clone()
+    
+    q.grad.zero_(); k.grad.zero_(); v.grad.zero_()
+
+    # 计算手动梯度 (Manual Backward)
+    try:
+        loss_manual = out_manual.sum()
+        loss_manual.backward()
+        grad_q_manual, grad_k_manual, grad_v_manual = q.grad.clone(), k.grad.clone(), v.grad.clone()
+        
+        # 对拍
+        diff_q = (grad_q_manual - grad_q_ref).abs().max().item()
+        diff_k = (grad_k_manual - grad_k_ref).abs().max().item()
+        diff_v = (grad_v_manual - grad_v_ref).abs().max().item()
+
+        print(f"\n🔍 Gradient Comparison:")
+        print(f"dQ Max Diff: {diff_q:.2e}")
+        print(f"dK Max Diff: {diff_k:.2e}")
+        print(f"dV Max Diff: {diff_v:.2e}")
+        
+        if diff_q < 1e-5 and diff_k < 1e-5 and diff_v < 1e-5:
+            print("\n✨ [PASS] Manual backward matches Autograd!")
+        else:
+            print("\n⚠️ [WARN] Gradients differ, check backward logic.")
+        
+    except Exception as e:
+        print(f"\n❌ Manual Backward Failed: {e}")
+        import traceback
+        traceback.print_exc()
