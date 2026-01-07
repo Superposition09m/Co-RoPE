@@ -15,29 +15,33 @@ from corope_attn_gqa_pytorch import attention_pytorch
 
 
 def bench_fwd_simple():
-    """简单的forward测速"""
+    """简单的forward测速 - GQA版本"""
     print("=" * 60)
-    print("Co-RoPE Forward Pass 简单测速")
+    print("Co-RoPE Forward Pass 简单测速 (GQA)")
     print("=" * 60)
     
-    # 小样本配置 - 统一使用标准配置（H_Q=H_KV），与原文件测试代码保持一致
-    B, H, N, D = 1, 4, 128, 64
+    # GQA 配置：H_Q != H_KV
+    B = 1
+    H_Q = 4      # Query heads
+    H_KV = 2     # Key/Value heads (GROUP_SIZE = 2)
+    N = 4096
+    D = 64
     causal = True
     sm_scale = 1.0 / (D ** 0.5)
     theta = 10000.0
-    warp_specialize = False  # 与原文件测试代码一致（非Blackwell默认False）
+    warp_specialize = False
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dtype = torch.float16
     
-    print(f"\n配置: B={B}, H={H}, N={N}, D={D}")
-    print(f"Device: {device}, Dtype: {dtype}")
+    print(f"\n配置: B={B}, H_Q={H_Q}, H_KV={H_KV}, N={N}, D={D}")
+    print(f"Device: {device}, Dtype: {dtype}, GROUP_SIZE={H_Q // H_KV}")
     
-    # 准备输入 - 统一配置，两个版本使用相同的输入
+    # 准备输入 - GQA 配置
     torch.manual_seed(42)
-    q = torch.randn(B, H, N, D, device=device, dtype=dtype)
-    k = torch.randn(B, H, N, D, device=device, dtype=dtype)
-    v = torch.randn(B, H, N, D, device=device, dtype=dtype)
+    q = torch.randn(B, H_Q, N, D, device=device, dtype=dtype)
+    k = torch.randn(B, H_KV, N, D, device=device, dtype=dtype)
+    v = torch.randn(B, H_KV, N, D, device=device, dtype=dtype)
     
     # Warmup
     print("\nWarmup...")

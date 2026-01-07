@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from flash_attn_v2_triton import attention as attention_v2
 from flash_attn_rope_v2_triton import attention as attention_rope_v2
-from flash_attn_rope_triton import attention as attention_rope_opt
+from flash_attn_rope_opt_triton import attention as attention_rope_opt
 from utils import calc_sim, assert_similar, print_red_warning
 
 
@@ -173,7 +173,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100):
     print("\n  [1. Flash v2 原版]", end=' ', flush=True)
     
     if mode == 'fwd':
-    fn_v2 = lambda: attention_v2(q, k, v, causal, sm_scale, False)
+        fn_v2 = lambda: attention_v2(q, k, v, causal, sm_scale, False)
     else:  # bwd
         o_v2 = attention_v2(q, k, v, causal, sm_scale, False)
         dout_v2 = torch.randn_like(o_v2)
@@ -192,7 +192,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100):
     print("  [2. Fused RoPE v2]", end=' ', flush=True)
     
     if mode == 'fwd':
-    fn_rope_v2 = lambda: attention_rope_v2(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
+        fn_rope_v2 = lambda: attention_rope_v2(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
     else:  # bwd
         o_rope_v2 = attention_rope_v2(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
         dout_rope_v2 = torch.randn_like(o_rope_v2)
@@ -211,7 +211,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100):
     print("  [3. Fused RoPE Opt]", end=' ', flush=True)
     
     if mode == 'fwd':
-    fn_rope_opt = lambda: attention_rope_opt(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
+        fn_rope_opt = lambda: attention_rope_opt(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
     else:  # bwd
         o_rope_opt = attention_rope_opt(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
         dout_rope_opt = torch.randn_like(o_rope_opt)

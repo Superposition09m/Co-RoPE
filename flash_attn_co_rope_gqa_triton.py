@@ -45,12 +45,15 @@ def is_hopper():
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q,  #
-                    desc_k, desc_v,  #
-                    offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
+def _attn_fwd_inner(acc, l_i, m_i, Q_ptr, Q_leader_ptr,  #
+                    K_ptr, desc_v,  #
+                    offset_q_y, offset_kv_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr):
+                    N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr,
+                    stride_q_seq: tl.constexpr, stride_q_dim: tl.constexpr,  #
+                    stride_k_seq: tl.constexpr, stride_k_dim: tl.constexpr,  #
+                    inv_freq_ptr, stride_inv_freq: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -60,17 +63,126 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     # causal = False
     else:
         lo, hi = 0, N_CTX
-    offsetk_y = offset_y + lo
-    if dtype == tl.float8e5:
-        offsetv_y = offset_y * HEAD_DIM + lo
-    else:
-        offsetv_y = offset_y + lo
-    # loop over k, v and update accumulator
+
+    # ============================================
+    # Co-RoPE Phase 1: Discovery Pass - compute mileage a_m
+    # ============================================
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_d_first = tl.arange(0, half_dim)
+    offs_d_second = offs_d_first + half_dim
+
+    # Load inv_freq once into registers
+    inv_freq = tl.load(inv_freq_ptr + offs_d_first * stride_inv_freq).to(tl.float32)
+
+    # Initialize mileage accumulator (must be float32)
+    a_m = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # Load q_leader using dual-pointer for first and second half
+    offs_q_m = tl.arange(0, BLOCK_M)
+    q_leader_1_ptrs = Q_leader_ptr + offs_q_m[:, None] * stride_q_seq + offs_d_first[None, :] * stride_q_dim
+    q_leader_2_ptrs = Q_leader_ptr + offs_q_m[:, None] * stride_q_seq + offs_d_second[None, :] * stride_q_dim
+    q_leader_1 = tl.load(q_leader_1_ptrs).to(tl.float32)
+    q_leader_2 = tl.load(q_leader_2_ptrs).to(tl.float32)
+
+    # Phase 1 loop: scan K to compute mileage
+    offsetk_y_phase1 = offset_kv_y + lo
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        # -- compute qk ----
-        k = desc_k.load([offsetk_y, 0]).T
-        qk = tl.dot(q, k)
+
+        # Load K using dual-pointer for first and second half
+        offs_k_n = tl.arange(0, BLOCK_N)
+        k1_ptrs = K_ptr + (offsetk_y_phase1 + offs_k_n[:, None]) * stride_k_seq + offs_d_first[None, :] * stride_k_dim
+        k2_ptrs = K_ptr + (offsetk_y_phase1 + offs_k_n[:, None]) * stride_k_seq + offs_d_second[None, :] * stride_k_dim
+
+        k1 = tl.load(k1_ptrs).to(tl.float32)
+        k2 = tl.load(k2_ptrs).to(tl.float32)
+
+        # Compute raw dot product: q_leader @ k^T (without RoPE)
+        qk_raw = tl.dot(q_leader_1, tl.trans(k1)) + tl.dot(q_leader_2, tl.trans(k2))
+
+        # Compute z = sigmoid(qk_raw * qk_scale)
+        energy = qk_raw * qk_scale
+        z = 1.0 / (1.0 + tl.math.exp2(-energy * 1.44269504))
+
+        # Apply causal mask for STAGE 2
+        if STAGE == 2:
+            mask = offs_m[:, None] > (start_n + offs_n[None, :])
+            z = tl.where(mask, z, 0.0)
+
+        # Accumulate mileage along K dimension (axis=1)
+        a_m += tl.sum(z, axis=1)
+
+        offsetk_y_phase1 += BLOCK_N
+
+    # ============================================
+    # Co-RoPE Phase 2: Computation Pass with EA-EB rotation
+    # ============================================
+    offsetk_y = offset_kv_y + lo
+    if dtype == tl.float8e5:
+        offsetv_y = offset_kv_y * HEAD_DIM + lo
+    else:
+        offsetv_y = offset_kv_y + lo
+
+    # Initialize running mileage (must be float32)
+    a_n_running = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # Load actual q using dual-pointer for first and second half
+    q1_ptrs = Q_ptr + offs_q_m[:, None] * stride_q_seq + offs_d_first[None, :] * stride_q_dim
+    q2_ptrs = Q_ptr + offs_q_m[:, None] * stride_q_seq + offs_d_second[None, :] * stride_q_dim
+    q1 = tl.load(q1_ptrs).to(tl.float32)
+    q2 = tl.load(q2_ptrs).to(tl.float32)
+
+    # Precompute Q phase outside loop (avoid 3D tensor in loop)
+    # phi_m = a_m * inv_freq: [BLOCK_M, half_dim]
+    phi_m = a_m[:, None] * inv_freq[None, :]
+    cos_am = tl.cos(phi_m)
+    sin_am = tl.sin(phi_m)
+
+    # Phase 2 loop: compute attention with Co-RoPE rotation
+    for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        # Load K using dual-pointer for first and second half
+        offs_k_n = tl.arange(0, BLOCK_N)
+        k1_ptrs = K_ptr + (offsetk_y + offs_k_n[:, None]) * stride_k_seq + offs_d_first[None, :] * stride_k_dim
+        k2_ptrs = K_ptr + (offsetk_y + offs_k_n[:, None]) * stride_k_seq + offs_d_second[None, :] * stride_k_dim
+
+        k1 = tl.load(k1_ptrs).to(tl.float32)
+        k2 = tl.load(k2_ptrs).to(tl.float32)
+
+        # Compute raw dot for leader to update running mileage
+        qk_raw_leader = tl.dot(q_leader_1, tl.trans(k1)) + tl.dot(q_leader_2, tl.trans(k2))
+        energy_leader = qk_raw_leader * qk_scale
+        z_current = 1.0 / (1.0 + tl.math.exp2(-energy_leader * 1.44269504))
+
+        # Compute cumsum within current block
+        z_cumsum = tl.cumsum(z_current, axis=1)
+
+        # Compute K mileage for this block: a_n = a_n_running + z_cumsum
+        # a_n_tile: [BLOCK_M, BLOCK_N]
+        a_n_tile = a_n_running[:, None] + z_cumsum
+
+        # Compute K phase (2D only to avoid 3D SFU explosion)
+        # Take row-wise average of a_n to get representative mileage per K token
+        a_n_avg = tl.sum(a_n_tile, axis=0) / BLOCK_M  # [BLOCK_N]
+        
+        # phi_n: [BLOCK_N, half_dim]
+        phi_n = a_n_avg[:, None] * inv_freq[None, :]
+        cos_an = tl.cos(phi_n)
+        sin_an = tl.sin(phi_n)
+
+        # Use addition formula: cos(am - an) = cos_am * cos_an + sin_am * sin_an
+        # cos_am: [BLOCK_M, half_dim], cos_an: [BLOCK_N, half_dim]
+        # Broadcasting creates [BLOCK_M, BLOCK_N, half_dim] with FMA, not SFU
+        cos_phi = cos_am[:, None, :] * cos_an[None, :, :] + sin_am[:, None, :] * sin_an[None, :, :]
+        sin_phi = sin_am[:, None, :] * cos_an[None, :, :] - cos_am[:, None, :] * sin_an[None, :, :]
+
+        # Compute EA and EB (先点积，后旋转)
+        E_A = tl.dot(q1, tl.trans(k1)) + tl.dot(q2, tl.trans(k2))
+        E_B = tl.dot(q2, tl.trans(k1)) - tl.dot(q1, tl.trans(k2))
+
+        # Apply rotation: qk = (E_A * cos_phi - E_B * sin_phi).sum(-1)
+        qk = tl.sum(E_A[:, :, None] * cos_phi - E_B[:, :, None] * sin_phi, axis=2)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -105,6 +217,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # place this at the end of the loop to reduce register pressure
         l_i = l_i * alpha + l_ij
         m_i = m_ij
+
+        # Update running mileage (sum along K dimension)
+        a_n_running += tl.sum(z_current, axis=1)
+
         offsetk_y += BLOCK_N
         offsetv_y += BLOCK_N
     return acc, l_i, m_i
@@ -114,14 +230,14 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
     HEAD_DIM = nargs["HEAD_DIM"]
-    if not isinstance(nargs["desc_q"], TensorDescriptor):
+    # Check if desc_v is a TensorDescriptor
+    if not isinstance(nargs["desc_v"], TensorDescriptor):
         return
-    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
+    # Set block shapes for V and O descriptors
     if nargs["FP8_OUTPUT"]:
         nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
     else:
         nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
 
@@ -173,11 +289,12 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_configs})
+# Temporarily disable autotune for debugging
+# @triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+#                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
-              Z, H_Q, H_KV, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+              Z, H_Q, H_KV, Q_ptr, K_ptr, desc_v, desc_o, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -187,7 +304,11 @@ def _attn_fwd(sm_scale, M,  #
               IS_HOPPER: tl.constexpr,  #
               GROUP_SIZE: tl.constexpr,  #
               dtype: tl.constexpr,  #
+              stride_q_z: tl.constexpr, stride_q_h: tl.constexpr, stride_q_seq: tl.constexpr, stride_q_dim: tl.constexpr,  #
+              stride_k_z: tl.constexpr, stride_k_h: tl.constexpr, stride_k_seq: tl.constexpr, stride_k_dim: tl.constexpr,  #
+              inv_freq_ptr,  #
               ):
+
     # dtype is now passed from forward function
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
@@ -198,23 +319,45 @@ def _attn_fwd(sm_scale, M,  #
 
     y_dim_q = Z * H_Q * N_CTX
     y_dim_kv = Z * H_KV * N_CTX
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
+
+    # Compute Q and K pointers with batch and head offset
+    Q_ptr_actual = Q_ptr + off_z * stride_q_z + off_h_q * stride_q_h + start_m * BLOCK_M * stride_q_seq
+    K_ptr_actual = K_ptr + off_z * stride_k_z + off_h_kv * stride_k_h
+
+    # Compute V pointer with batch and head offset, then create descriptor
+    # V needs proper pointer offset before creating descriptor
+    if isinstance(desc_v, tl.tensor_descriptor):
+        # Already a descriptor, use as-is (will be handled by _maybe_make_tensor_desc)
+        pass
+    else:
+        # It's a pointer, add batch and head offset
+        # Assuming V has same strides as K since they have same shape
+        desc_v = desc_v + off_z * stride_k_z + off_h_kv * stride_k_h
+
     if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim_kv], strides=[N_CTX, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, N_CTX], strides=[N_CTX, stride_k_dim],
                                          block_shape=[HEAD_DIM, BLOCK_N])
     else:
-
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim_kv, HEAD_DIM], strides=[HEAD_DIM, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[N_CTX, HEAD_DIM], strides=[stride_k_seq, stride_k_dim],
                                          block_shape=[BLOCK_N, HEAD_DIM])
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim_kv, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
+
+    # Similarly for O
+    if isinstance(desc_o, tl.tensor_descriptor):
+        pass
+    else:
+        desc_o = desc_o + off_z * stride_q_z + off_h_q * stride_q_h
+
+    desc_o = _maybe_make_tensor_desc(desc_o, shape=[N_CTX, HEAD_DIM], strides=[stride_q_seq, stride_q_dim],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_kv_y = off_z * (N_CTX * H_KV) + off_h_kv * N_CTX
-    offset_q_y = off_z * (N_CTX * H_Q) + off_h_q * N_CTX
-    qo_offset_y = offset_q_y + start_m * BLOCK_M
+    # Compute leader Q pointer
+    leader_h_q = (off_h_q // GROUP_SIZE) * GROUP_SIZE
+    Q_leader_ptr_actual = Q_ptr + off_z * stride_q_z + leader_h_q * stride_q_h + start_m * BLOCK_M * stride_q_seq
+
+    # For V and O descriptors, offset is now relative to the head (batch and head offset already applied)
+    # So we only need the sequence offset
+    offset_kv_y = 0  # V descriptor already points to correct batch/head
+    offset_q_y = 0   # Q pointer already points to correct position
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -225,31 +368,38 @@ def _attn_fwd(sm_scale, M,  #
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
-    # load q: it will stay in SRAM throughout
-    q = desc_q.load([qo_offset_y, 0])
+
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
-                                        desc_k, desc_v,  #
-                                        offset_kv_y, dtype, start_m, qk_scale,  #
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, Q_ptr_actual, Q_leader_ptr_actual,  #
+                                        K_ptr_actual, desc_v,  #
+                                        offset_q_y, offset_kv_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER)
+                                        warp_specialize, IS_HOPPER,
+                                        stride_q_seq, stride_q_dim,  #
+                                        stride_k_seq, stride_k_dim,  #
+                                        inv_freq_ptr, 1)
     # stage 2: on-band
     if STAGE & 2:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
-                                        desc_k, desc_v,  #
-                                        offset_kv_y, dtype, start_m, qk_scale,  #
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, Q_ptr_actual, Q_leader_ptr_actual,  #
+                                        K_ptr_actual, desc_v,  #
+                                        offset_q_y, offset_kv_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER)
+                                        warp_specialize, IS_HOPPER,
+                                        stride_q_seq, stride_q_dim,  #
+                                        stride_k_seq, stride_k_dim,  #
+                                        inv_freq_ptr, 1)
     # epilogue
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
+    # Store output using descriptor
+    qo_offset_y = offset_q_y + start_m * BLOCK_M
     desc_o.store([qo_offset_y, 0], acc.to(dtype))
 
 
@@ -530,27 +680,15 @@ class _attention(torch.autograd.Function):
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
         M = torch.empty((q.shape[0], H_Q, q.shape[2]), device=q.device, dtype=torch.float32)
-        # Use device_descriptor for Hopper + warpspec.
-        if supports_host_descriptor() and not (is_hopper() and warp_specialize):
-            # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-            y_dim_q = q.shape[0] * H_Q * q.shape[2]
-            y_dim_kv = q.shape[0] * H_KV * q.shape[2]
 
-            dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim_kv], strides=[q.shape[2], 1],
-                                          block_shape=dummy_block)
-            else:
-                desc_v = TensorDescriptor(v, shape=[y_dim_kv, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
-                                          block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim_kv, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-        else:
-            desc_q = q
-            desc_v = v
-            desc_k = k
-            desc_o = o
+        # Compute inv_freq for Co-RoPE (theta=10000.0)
+        theta = 10000.0
+        inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM_K, 2, device=q.device, dtype=torch.float32) / HEAD_DIM_K))
+
+        # For now, always use plain pointers (not TensorDescriptor)
+        # since autotune is disabled and pre_hook won't update block_shape
+        desc_v = v
+        desc_o = o
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -577,18 +715,25 @@ class _attention(torch.autograd.Function):
         else:  # torch.float32
             triton_dtype = tl.float32
         
+        # Fixed configuration for debugging (no autotune)
         _attn_fwd[grid](
             sm_scale, M,  #
             q.shape[0], H_Q, H_KV,  #
-            desc_q, desc_k, desc_v, desc_o,  #
+            q, k, desc_v, desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
+            BLOCK_M=64,  #
+            BLOCK_N=64,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             IS_HOPPER=is_hopper(),  #
             GROUP_SIZE=GROUP_SIZE,  #
             dtype=triton_dtype,  #
+            stride_q_z=q.stride(0), stride_q_h=q.stride(1), stride_q_seq=q.stride(2), stride_q_dim=q.stride(3),  #
+            stride_k_z=k.stride(0), stride_k_h=k.stride(1), stride_k_seq=k.stride(2), stride_k_dim=k.stride(3),  #
+            inv_freq_ptr=inv_freq,  #
+            num_warps=4,  #
             **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M)
