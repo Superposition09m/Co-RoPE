@@ -10,6 +10,7 @@ This repository presents a comprehensive exploration of **efficient positional e
 ### Algorithm
 
 **Rotary Positional Embedding (RoPE)** encodes absolute positional information by rotating the query and key vectors in a high-dimensional space. Given a position $m$ and a vector $\mathbf{x}(\mathbf{q} \text{ or } \mathbf{k})$, the rotation is defined as:
+
 $$f(\mathbf{x}, m) = \begin{pmatrix} x_1 \\ x_2 \\ \vdots \\ x_d \end{pmatrix} \otimes \begin{pmatrix} \cos m\theta_1 \\ \cos m\theta_1 \\ \vdots \\ \cos m\theta_{d/2} \end{pmatrix} + \begin{pmatrix} -x_2 \\ x_1 \\ \vdots \\ -x_{d-1} \end{pmatrix} \otimes \begin{pmatrix} \sin m\theta_1 \\ \sin m\theta_1 \\ \vdots \\ \sin m\theta_{d/2} \end{pmatrix}$$
 
 > [Note] In code implementation(like `transformers`), we often use half layout instead of interleaved layout, which is more efficient for GPU operations.
@@ -17,6 +18,21 @@ $$f(\mathbf{x}, m) = \begin{pmatrix} x_1 \\ x_2 \\ \vdots \\ x_d \end{pmatrix} \
 ### Triton Kernel Optimization
 
 
+
+
+### Performance Benchmark
+Foward Pass*
+| |FLOPS| TIME|
+|---|---|---|
+||1000|100|
+||1000|100|
+
+
+*Backward Pass*
+| |FLOPS| TIME|
+|---|---|---|
+||1000|100|
+||1000|100|
 
 
 ## Co-RoPE(Experimental)
@@ -85,37 +101,7 @@ we use GQA to implement the Co-RoPE, to reduce the computational cost of the Co-
 
 We use a leader head to compute the contextual mileage and the accumulated mileage, and then broadcast the mileage to all the heads in the group.
 
-### Triton Kernel Optimization
-
-From Flash Attention v2(https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html).
-
-We start from the Triton kernel of Flash Attention v2, and then modify it to implement the Co-RoPE.
-
-1. GQA implementation
-
-2. Fwd Kernel Optimization
-"加法定理手术刀"
-
-3. Bwd Kernel Optimization
-
-
-### Performance Benchmark
-On Nvidia H200
-
-
-*Foward Pass*
-| |FLOPS| TIME|
-|---|---|---|
-||1000|100|
-||1000|100|
-
-
-*Backward Pass*
-| |FLOPS| TIME|
-|---|---|---|
-||1000|100|
-||1000|100|
-
+### Bottleneck Analysis
 
 
 ## Environment:

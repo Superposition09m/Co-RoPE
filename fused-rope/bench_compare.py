@@ -235,30 +235,34 @@ def main():
     print("="*80)
     
     # 测试配置：(BATCH, H, N_CTX, HEAD_DIM, causal, name)
+    # 方案A：全面测试（只测 causal=True，覆盖实际 LLM 场景）
     configs = [
-        # D=64 配置 - 从 512 到 512K
-        (2, 8, 512, 64, False, "512-D64"),
-        (2, 8, 1024, 64, False, "1K-D64"),
-        (2, 8, 2048, 64, False, "2K-D64"),
-        (2, 8, 4096, 64, False, "4K-D64"),
-        (1, 8, 8192, 64, False, "8K-D64"),
-        (1, 8, 16384, 64, False, "16K-D64"),
-        (1, 8, 32768, 64, False, "32K-D64"),
-        (1, 4, 65536, 64, False, "64K-D64"),
-        (1, 2, 131072, 64, False, "128K-D64"),
-        (1, 2, 262144, 64, False, "256K-D64"),
-        (1, 1, 524288, 64, False, "512K-D64"),
-        # D=128 配置 - 从 512 到 256K
-        (2, 8, 512, 128, False, "512-D128"),
-        (2, 8, 1024, 128, False, "1K-D128"),
-        (2, 8, 2048, 128, False, "2K-D128"),
-        (2, 8, 4096, 128, False, "4K-D128"),
-        (1, 8, 8192, 128, False, "8K-D128"),
-        (1, 8, 16384, 128, False, "16K-D128"),
-        (1, 4, 32768, 128, False, "32K-D128"),
-        (1, 2, 65536, 128, False, "64K-D128"),
-        (1, 2, 131072, 128, False, "128K-D128"),
-        (1, 1, 262144, 128, False, "256K-D128"),
+        # === 小模型配置 (D=64) ===
+        (4, 8, 512, 64, True, "Small-512"),
+        (4, 8, 1024, 64, True, "Small-1K"),
+        (2, 8, 2048, 64, True, "Small-2K"),
+        (2, 8, 4096, 64, True, "Small-4K"),
+        (1, 8, 8192, 64, True, "Small-8K"),
+        
+        # === 标准配置 (D=128, 类似 Llama-7B: 32 heads) ===
+        (4, 32, 512, 128, True, "Llama7B-512"),
+        (4, 32, 1024, 128, True, "Llama7B-1K"),
+        (2, 32, 2048, 128, True, "Llama7B-2K"),
+        (2, 32, 4096, 128, True, "Llama7B-4K"),
+        (1, 32, 8192, 128, True, "Llama7B-8K"),
+        (1, 32, 16384, 128, True, "Llama7B-16K"),
+        
+        # === 大模型配置 (D=128, 类似 Llama-70B: 64 heads) ===
+        (2, 64, 512, 128, True, "Llama70B-512"),
+        (2, 64, 1024, 128, True, "Llama70B-1K"),
+        (1, 64, 2048, 128, True, "Llama70B-2K"),
+        (1, 64, 4096, 128, True, "Llama70B-4K"),
+        (1, 32, 8192, 128, True, "Llama70B-8K"),
+        
+        # === 超长序列 (显存优化配置) ===
+        (1, 16, 32768, 128, True, "Long-32K"),
+        (1, 8, 65536, 128, True, "Long-64K"),
+        (1, 4, 131072, 128, True, "Long-128K"),
     ]
     
     # 正确性测试
@@ -270,7 +274,7 @@ def main():
     print("\n" + "-"*80)
     print("1.1 Forward 正确性测试")
     print("-"*80)
-    fwd_correctness_passed = test_correctness(1, 2, 128, 64, causal=False, test_backward=False)
+    fwd_correctness_passed = test_correctness(1, 2, 128, 64, causal=True, test_backward=False)
     
     if not fwd_correctness_passed:
         print("\n⚠️  Forward 正确性测试未通过，停止测试")
@@ -280,7 +284,7 @@ def main():
     print("\n" + "-"*80)
     print("1.2 Backward 正确性测试")
     print("-"*80)
-    bwd_correctness_passed = test_correctness(1, 2, 128, 64, causal=False, test_backward=True)
+    bwd_correctness_passed = test_correctness(1, 2, 128, 64, causal=True, test_backward=True)
     
     if not bwd_correctness_passed:
         print("\n⚠️  Backward 正确性测试未通过，停止测试")
