@@ -46,3 +46,4 @@ if __name__ == "__main__":
     test_case(1, 8, 4, 32, 64)  # GROUP_SIZE=2
     test_case(1, 4, 2, 64, 64)  # 更长序列
 
+
