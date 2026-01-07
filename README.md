@@ -5,6 +5,48 @@ This repository presents a comprehensive exploration of **efficient positional e
 =
 - and an experimental implementation of **Co-RoPE**, which is a context-aware improvement of RoPE.
 
+## Code Structure
+
+```
+.
+├── assets
+├── corope-exp
+│   ├── compare_corope.py
+│   ├── corope_attn_gqa_pytorch.py
+│   └── flash_attn_co_rope_gqa_triton.py
+├── fused-rope
+│   ├── bench_compare.py
+│   ├── flash_attn_rope_opt_triton.py
+│   ├── flash_attn_rope_v2_triton.py
+│   ├── flash_attn_v2_triton.py
+│   ├── rope_attn_pytorch.py
+│   └── verification.py
+├── README.md
+└── utils.py
+```
+
+## Environment:
+```
+PyTorch: 2.9.1+cu128
+CUDA Version: 12.8
+GPU: NVIDIA H200
+Triton: 3.5.1
+NumPy: 2.3.5
+einops: 0.8.1
+flash-attn: 2.8.3
+transformers: 4.57.3
+```
+Install Env:
+```bash
+conda create -n corope python==3.12
+conda activate corope
+pip install torch triton
+#use flash-attn as comparison
+pip install packaging ninja psutil
+pip install flash-attn --no-build-isolation
+pip install transformers
+```
+
 ## Fused RoPE
 
 ### Algorithm
@@ -104,24 +146,3 @@ We use a leader head to compute the contextual mileage and the accumulated milea
 ### Bottleneck Analysis
 
 
-## Environment:
-```
-PyTorch: 2.9.1+cu128
-CUDA Version: 12.8
-GPU: NVIDIA H200
-Triton: 3.5.1
-NumPy: 2.3.5
-einops: 0.8.1
-flash-attn: 2.8.3
-transformers: 4.57.3
-```
-Install Env:
-```bash
-conda create -n corope python==3.12
-conda activate corope
-pip install torch triton
-#use flash-attn as comparison
-pip install packaging ninja psutil
-pip install flash-attn --no-build-isolation
-pip install transformers
-```

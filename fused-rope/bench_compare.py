@@ -18,6 +18,7 @@ import os
 import triton
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # 添加上一层目录
 
 from flash_attn_v2_triton import attention as attention_v2
 from flash_attn_rope_v2_triton import attention as attention_rope_v2
