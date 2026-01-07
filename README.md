@@ -9,7 +9,7 @@ Co-RoPE is a context-aware improvement of RoPE. In this project, we implement th
 
 - CoPE: https://arxiv.org/abs/2405.18719
 
-![CoRoPE](./assets/CoRoPE.png)
+![CoRoPE](./assets/corope.png)
 
 ### Our Methodology
 
