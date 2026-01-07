@@ -45,19 +45,12 @@ def is_hopper():
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i,  #
-                    q1_rot, q2_rot,  #
-                    k_ptr, desc_v,  #
-                    freqs_cos_ptr, freqs_sin_ptr,  #
-                    stride_k_tok, stride_k_dim,  #
-                    stride_freqs_seq, stride_freqs_dim,  #
+def _attn_fwd_inner(acc, l_i, m_i, q,  #
+                    desc_k, desc_v,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr):
-    half_dim: tl.constexpr = HEAD_DIM // 2
-    offs_d_first = tl.arange(0, half_dim)
-    offs_d_second = offs_d_first + half_dim
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -67,6 +60,7 @@ def _attn_fwd_inner(acc, l_i, m_i,  #
     # causal = False
     else:
         lo, hi = 0, N_CTX
+    offsetk_y = offset_y + lo
     if dtype == tl.float8e5:
         offsetv_y = offset_y * HEAD_DIM + lo
     else:
@@ -74,27 +68,9 @@ def _attn_fwd_inner(acc, l_i, m_i,  #
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        offs_n_curr = start_n + offs_n
-        mask_k = offs_n_curr[:, None] < N_CTX
-        mask_k = mask_k & (offs_d_first[None, :] >= 0)
-
-        freqs_cos_ptrs = freqs_cos_ptr + offs_n_curr[:, None] * stride_freqs_seq + \
-            offs_d_first[None, :] * stride_freqs_dim
-        freqs_sin_ptrs = freqs_sin_ptr + offs_n_curr[:, None] * stride_freqs_seq + \
-            offs_d_first[None, :] * stride_freqs_dim
-        cos_k = tl.load(freqs_cos_ptrs, mask=mask_k, other=1.0).to(tl.float32)
-        sin_k = tl.load(freqs_sin_ptrs, mask=mask_k, other=0.0).to(tl.float32)
-
-        k1_ptrs = k_ptr + offs_n_curr[:, None] * stride_k_tok + offs_d_first[None, :] * stride_k_dim
-        k2_ptrs = k_ptr + offs_n_curr[:, None] * stride_k_tok + offs_d_second[None, :] * stride_k_dim
-        k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
-        k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
-
-        k1_rot = (k1.to(tl.float32) * cos_k - k2.to(tl.float32) * sin_k).to(q1_rot.dtype)
-        k2_rot = (k2.to(tl.float32) * cos_k + k1.to(tl.float32) * sin_k).to(q2_rot.dtype)
-
-        qk = tl.dot(q1_rot, tl.trans(k1_rot))
-        qk += tl.dot(q2_rot, tl.trans(k2_rot))
+        # -- compute qk ----
+        k = desc_k.load([offsetk_y, 0]).T
+        qk = tl.dot(q, k)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -129,6 +105,7 @@ def _attn_fwd_inner(acc, l_i, m_i,  #
         # place this at the end of the loop to reduce register pressure
         l_i = l_i * alpha + l_ij
         m_i = m_ij
+        offsetk_y += BLOCK_N
         offsetv_y += BLOCK_N
     return acc, l_i, m_i
 
@@ -137,15 +114,15 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
     HEAD_DIM = nargs["HEAD_DIM"]
-    desc_v = nargs.get("desc_v")
-    desc_o = nargs.get("desc_o")
-    if not isinstance(desc_v, TensorDescriptor) or not isinstance(desc_o, TensorDescriptor):
+    if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
+    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
     if nargs["FP8_OUTPUT"]:
-        desc_v.block_shape = [HEAD_DIM, BLOCK_N]
+        nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
     else:
-        desc_v.block_shape = [BLOCK_N, HEAD_DIM]
-    desc_o.block_shape = [BLOCK_M, HEAD_DIM]
+        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
+    nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
+    nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
 
 if is_hip():
@@ -200,11 +177,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
-              freqs_cos_ptr, freqs_sin_ptr,  #
-              stride_freqs_seq, stride_freqs_dim,  #
-              Z, H, Q, K, desc_v, desc_o, N_CTX,  #
-              stride_qz, stride_qh, stride_qm, stride_qd,  #
-              stride_kz, stride_kh, stride_km, stride_kd,  #
+              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -221,12 +194,17 @@ def _attn_fwd(sm_scale, M,  #
     off_h = off_hz % H
 
     y_dim = Z * H * N_CTX
+    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                     block_shape=[BLOCK_M, HEAD_DIM])
     if FP8_OUTPUT:
         desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
                                          block_shape=[HEAD_DIM, BLOCK_N])
     else:
+        
         desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                          block_shape=[BLOCK_N, HEAD_DIM])
+    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                     block_shape=[BLOCK_N, HEAD_DIM])
     desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
@@ -242,52 +220,22 @@ def _attn_fwd(sm_scale, M,  #
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
-    half_dim: tl.constexpr = HEAD_DIM // 2
-    offs_d_first = tl.arange(0, half_dim)
-    offs_d_second = offs_d_first + half_dim
-
-    q_head_ptr = Q + off_z * stride_qz + off_h * stride_qh
-    k_head_ptr = K + off_z * stride_kz + off_h * stride_kh
-
-    mask_q = offs_m[:, None] < N_CTX
-    mask_q = mask_q & (offs_d_first[None, :] >= 0)
-    q1_ptrs = q_head_ptr + offs_m[:, None] * stride_qm + offs_d_first[None, :] * stride_qd
-    q2_ptrs = q_head_ptr + offs_m[:, None] * stride_qm + offs_d_second[None, :] * stride_qd
-    q1 = tl.load(q1_ptrs, mask=mask_q, other=0.0)
-    q2 = tl.load(q2_ptrs, mask=mask_q, other=0.0)
-
-    freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + \
-        offs_d_first[None, :] * stride_freqs_dim
-    freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + \
-        offs_d_first[None, :] * stride_freqs_dim
-    cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
-    sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
-
-    q1_rot = (q1.to(tl.float32) * cos_q - q2.to(tl.float32) * sin_q).to(q1.dtype)
-    q2_rot = (q2.to(tl.float32) * cos_q + q1.to(tl.float32) * sin_q).to(q2.dtype)
-
+    # load q: it will stay in SRAM throughout
+    q = desc_q.load([qo_offset_y, 0])
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i,  #
-                                        q1_rot, q2_rot,  #
-                                        k_head_ptr, desc_v,  #
-                                        freqs_cos_ptr, freqs_sin_ptr,  #
-                                        stride_km, stride_kd,  #
-                                        stride_freqs_seq, stride_freqs_dim,  #
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
+                                        desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
                                         warp_specialize, IS_HOPPER)
     # stage 2: on-band
     if STAGE & 2:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i,  #
-                                        q1_rot, q2_rot,  #
-                                        k_head_ptr, desc_v,  #
-                                        freqs_cos_ptr, freqs_sin_ptr,  #
-                                        stride_km, stride_kd,  #
-                                        stride_freqs_seq, stride_freqs_dim,  #
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
+                                        desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
@@ -319,90 +267,75 @@ def _attn_bwd_preprocess(O, DO,  #
 
 # The main inner-loop logic for computing dK and dV.
 @triton.jit
-def _attn_bwd_dkdv(dk1, dk2, dv,  #
-                   Q, k1_rot, k2_rot, v,  #
-                   freqs_cos_ptr, freqs_sin_ptr,  #
+def _attn_bwd_dkdv(dk, dv,  #
+                   Q, k, v, sm_scale,  #
                    DO,  #
                    M, D,  #
+                   # shared by Q/K/V/DO.
                    stride_tok, stride_d,  #
-                   stride_freqs_seq, stride_freqs_dim,  #
                    H, N_CTX, BLOCK_M1: tl.constexpr,  #
                    BLOCK_N1: tl.constexpr,  #
                    HEAD_DIM: tl.constexpr,  #
+                   # Filled in by the wrapper.
                    start_n, start_m, num_steps,  #
                    MASK: tl.constexpr):
-    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
-    offs_d_first = tl.arange(0, half_dim)
-    offs_d_second = offs_d_first + half_dim
-
+    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
+    do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
+        qT = tl.load(qT_ptrs)
+        # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        mask_q = offs_m[:, None] < N_CTX
-        mask_q = mask_q & (offs_d_first[None, :] >= 0)
-        q1_ptrs = Q + offs_m[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-        q2_ptrs = Q + offs_m[:, None] * stride_tok + offs_d_second[None, :] * stride_d
-        q1 = tl.load(q1_ptrs, mask=mask_q, other=0.0)
-        q2 = tl.load(q2_ptrs, mask=mask_q, other=0.0)
-
-        freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + \
-            offs_d_first[None, :] * stride_freqs_dim
-        freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + \
-            offs_d_first[None, :] * stride_freqs_dim
-        cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
-        sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
-
-        q1_rot = (q1.to(tl.float32) * cos_q - q2.to(tl.float32) * sin_q).to(tl.float16)
-        q2_rot = (q2.to(tl.float32) * cos_q + q1.to(tl.float32) * sin_q).to(tl.float16)
-
         m = tl.load(M + offs_m)
-        qkT = tl.dot(k1_rot, tl.trans(q1_rot))
-        qkT += tl.dot(k2_rot, tl.trans(q2_rot))
+        qkT = tl.dot(k, qT)
         pT = tl.math.exp2(qkT - m[None, :])
+        # Autoregressive masking.
         if MASK:
-            mask = offs_m[None, :] >= offs_n[:, None]
+            mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
-
-        do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
         do = tl.load(do_ptrs)
-
-        dv += tl.dot(pT.to(tl.float16), do)
-
+        # Compute dV.
+        ppT = pT
+        ppT = ppT.to(tl.float16)
+        dv += tl.dot(ppT, do)
+        # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
+        # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(tl.float16)
-
-        dk1 += tl.dot(dsT, q1_rot)
-        dk2 += tl.dot(dsT, q2_rot)
-
+        dk += tl.dot(dsT, tl.trans(qT))
+        # Increment pointers.
         curr_m += step_m
-    return dk1, dk2, dv
+        qT_ptrs += step_m * stride_tok
+        do_ptrs += step_m * stride_tok
+    return dk, dv
 
 
 # the main inner-loop logic for computing dQ
 @triton.jit
-def _attn_bwd_dq(dq1, dq2,  #
-                 q1_rot, q2_rot, K, V,  #
-                 do, m, D,  #
-                 freqs_cos_ptr, freqs_sin_ptr,  #
+def _attn_bwd_dq(dq, q, K, V,  #
+                 do, m, D,
+                 # shared by Q/K/V/DO.
                  stride_tok, stride_d,  #
-                 stride_freqs_seq, stride_freqs_dim,  #
                  H, N_CTX,  #
                  BLOCK_M2: tl.constexpr,  #
                  BLOCK_N2: tl.constexpr,  #
                  HEAD_DIM: tl.constexpr,
+                 # Filled in by the wrapper.
                  start_m, start_n, num_steps,  #
                  MASK: tl.constexpr):
-    half_dim: tl.constexpr = HEAD_DIM // 2
     offs_m = start_m + tl.arange(0, BLOCK_M2)
+    offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
-    offs_d_first = tl.arange(0, half_dim)
-    offs_d_second = offs_d_first + half_dim
+    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
@@ -410,53 +343,35 @@ def _attn_bwd_dq(dq1, dq2,  #
     curr_n = start_n
     step_n = BLOCK_N2
     for blk_idx in range(num_steps):
-        offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        mask_k = offs_n[:, None] < N_CTX
-        mask_k = mask_k & (offs_d_first[None, :] >= 0)
-
-        freqs_cos_k_ptrs = freqs_cos_ptr + offs_n[:, None] * stride_freqs_seq + \
-            offs_d_first[None, :] * stride_freqs_dim
-        freqs_sin_k_ptrs = freqs_sin_ptr + offs_n[:, None] * stride_freqs_seq + \
-            offs_d_first[None, :] * stride_freqs_dim
-        cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
-        sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
-
-        k1_ptrs = K + offs_n[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-        k2_ptrs = K + offs_n[:, None] * stride_tok + offs_d_second[None, :] * stride_d
-        k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
-        k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
-
-        k1_rot = (k1.to(tl.float32) * cos_k - k2.to(tl.float32) * sin_k).to(tl.float16)
-        k2_rot = (k2.to(tl.float32) * cos_k + k1.to(tl.float32) * sin_k).to(tl.float16)
-
-        v_ptrs = V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-        v = tl.load(v_ptrs)
-
-        qk = tl.dot(q1_rot, tl.trans(k1_rot))
-        qk += tl.dot(q2_rot, tl.trans(k2_rot))
+        kT = tl.load(kT_ptrs)
+        vT = tl.load(vT_ptrs)
+        qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
+        # Autoregressive masking.
         if MASK:
-            mask = offs_m[:, None] >= offs_n[None, :]
+            offs_n = curr_n + tl.arange(0, BLOCK_N2)
+            mask = (offs_m[:, None] >= offs_n[None, :])
             p = tl.where(mask, p, 0.0)
-
-        dp = tl.dot(do, tl.trans(v)).to(tl.float32)
+        # Compute dP and dS.
+        dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
         ds = ds.to(tl.float16)
-
-        dq1 += tl.dot(ds, k1_rot)
-        dq2 += tl.dot(ds, k2_rot)
-
+        # Compute dQ.
+        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
+        dq += tl.dot(ds, tl.trans(kT))
+        # Increment pointers.
         curr_n += step_n
-    return dq1, dq2
+        kT_ptrs += step_n * stride_tok
+        vT_ptrs += step_n * stride_tok
+    return dq
 
 
 @triton.jit
 def _attn_bwd(Q, K, V, sm_scale,  #
               DO,  #
               DQ, DK, DV,  #
-              M, D,  #
-              freqs_cos_ptr, freqs_sin_ptr,  #
-              stride_freqs_seq, stride_freqs_dim,  #
+              M, D,
+              # shared by Q/K/V/DO.
               stride_z, stride_h, stride_tok, stride_d,  #
               H, N_CTX,  #
               BLOCK_M1: tl.constexpr,  #
@@ -467,9 +382,6 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               HEAD_DIM: tl.constexpr,  #
               CAUSAL: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
-    half_dim: tl.constexpr = HEAD_DIM // 2
-    offs_d_first = tl.arange(0, half_dim)
-    offs_d_second = offs_d_first + half_dim
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
@@ -487,6 +399,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     M += off_chz
     D += off_chz
 
+    # load scales
     offs_k = tl.arange(0, HEAD_DIM)
 
     start_n = pid * BLOCK_N1
@@ -496,69 +409,51 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     offs_n = start_n + tl.arange(0, BLOCK_N1)
 
     dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-    dk1 = tl.zeros([BLOCK_N1, half_dim], dtype=tl.float32)
-    dk2 = tl.zeros([BLOCK_N1, half_dim], dtype=tl.float32)
+    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
-    mask_k = offs_n[:, None] < N_CTX
-    mask_k = mask_k & (offs_d_first[None, :] >= 0)
-    k1_ptrs = K + offs_n[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-    k2_ptrs = K + offs_n[:, None] * stride_tok + offs_d_second[None, :] * stride_d
-    k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
-    k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
-
-    freqs_cos_k_ptrs = freqs_cos_ptr + offs_n[:, None] * stride_freqs_seq + \
-        offs_d_first[None, :] * stride_freqs_dim
-    freqs_sin_k_ptrs = freqs_sin_ptr + offs_n[:, None] * stride_freqs_seq + \
-        offs_d_first[None, :] * stride_freqs_dim
-    cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
-    sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
-
-    k1_rot = (k1.to(tl.float32) * cos_k - k2.to(tl.float32) * sin_k).to(tl.float16)
-    k2_rot = (k2.to(tl.float32) * cos_k + k1.to(tl.float32) * sin_k).to(tl.float16)
+    # load K and V: they stay in SRAM throughout the inner loop.
+    k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
     v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
 
     if CAUSAL:
         start_m = start_n
         num_steps = BLOCK_N1 // MASK_BLOCK_M1
-        dk1, dk2, dv = _attn_bwd_dkdv(dk1, dk2, dv,  #
-                                      Q, k1_rot, k2_rot, v,  #
-                                      freqs_cos_ptr, freqs_sin_ptr,  #
-                                      DO,  #
-                                      M, D,  #
-                                      stride_tok, stride_d,  #
-                                      stride_freqs_seq, stride_freqs_dim,  #
-                                      H, N_CTX,  #
-                                      MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                                      start_n, start_m, num_steps,  #
-                                      MASK=True,  #
-                                      )
+        dk, dv = _attn_bwd_dkdv(dk, dv,  #
+                                Q, k, v, sm_scale,  #
+                                DO,  #
+                                M, D,  #
+                                stride_tok, stride_d,  #
+                                H, N_CTX,  #
+                                MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+                                start_n, start_m, num_steps,  #
+                                MASK=True,  #
+                                )
+
         start_m += num_steps * MASK_BLOCK_M1
 
+    # Compute dK and dV for non-masked blocks.
     num_steps = (N_CTX - start_m) // BLOCK_M1
-    dk1, dk2, dv = _attn_bwd_dkdv(dk1, dk2, dv,  #
-                                  Q, k1_rot, k2_rot, v,  #
-                                  freqs_cos_ptr, freqs_sin_ptr,  #
-                                  DO,  #
-                                  M, D,  #
-                                  stride_tok, stride_d,  #
-                                  stride_freqs_seq, stride_freqs_dim,  #
-                                  H, N_CTX,  #
-                                  BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                                  start_n, start_m, num_steps,  #
-                                  MASK=False,  #
-                                  )
+    dk, dv = _attn_bwd_dkdv(  #
+        dk, dv,  #
+        Q, k, v, sm_scale,  #
+        DO,  #
+        M, D,  #
+        stride_tok, stride_d,  #
+        H, N_CTX,  #
+        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+        start_n, start_m, num_steps,  #
+        MASK=False,  #
+    )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv)
 
-    dk1_inv = ((dk1 * cos_k + dk2 * sin_k) * sm_scale).to(tl.float16)
-    dk2_inv = ((dk2 * cos_k - dk1 * sin_k) * sm_scale).to(tl.float16)
-    dk1_ptrs = DK + offs_n[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-    dk2_ptrs = DK + offs_n[:, None] * stride_tok + offs_d_second[None, :] * stride_d
-    tl.store(dk1_ptrs, dk1_inv, mask=mask_k)
-    tl.store(dk2_ptrs, dk2_inv, mask=mask_k)
+    # Write back dK.
+    dk *= sm_scale
+    dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    tl.store(dk_ptrs, dk)
 
-    # dQ block
+    # THIS BLOCK DOES DQ:
     start_m = pid * BLOCK_M2
     start_n = 0
     num_steps = N_CTX // BLOCK_N2
@@ -566,73 +461,52 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
     offs_m = start_m + tl.arange(0, BLOCK_M2)
 
-    mask_q = offs_m[:, None] < N_CTX
-    mask_q = mask_q & (offs_d_first[None, :] >= 0)
-
-    q1_ptrs = Q + offs_m[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-    q2_ptrs = Q + offs_m[:, None] * stride_tok + offs_d_second[None, :] * stride_d
-    q1 = tl.load(q1_ptrs, mask=mask_q, other=0.0)
-    q2 = tl.load(q2_ptrs, mask=mask_q, other=0.0)
-
-    freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + \
-        offs_d_first[None, :] * stride_freqs_dim
-    freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + \
-        offs_d_first[None, :] * stride_freqs_dim
-    cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
-    sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
-
-    q1_rot = (q1.to(tl.float32) * cos_q - q2.to(tl.float32) * sin_q).to(tl.float16)
-    q2_rot = (q2.to(tl.float32) * cos_q + q1.to(tl.float32) * sin_q).to(tl.float16)
-
-    dq1 = tl.zeros([BLOCK_M2, half_dim], dtype=tl.float32)
-    dq2 = tl.zeros([BLOCK_M2, half_dim], dtype=tl.float32)
+    q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
     do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
 
-    m = tl.load(M + offs_m)[:, None]
+    m = tl.load(M + offs_m)
+    m = m[:, None]
 
     if CAUSAL:
+        # Compute dQ for masked (diagonal) blocks.
+        # NOTE: This code scans each row of QK^T backward (from right to left,
+        # but inside each call to _attn_bwd_dq, from left to right), but that's
+        # not due to anything important.  I just wanted to reuse the loop
+        # structure for dK & dV above as much as possible.
         end_n = start_m + BLOCK_M2
         num_steps = BLOCK_M2 // MASK_BLOCK_N2
-        dq1, dq2 = _attn_bwd_dq(dq1, dq2,  #
-                                q1_rot, q2_rot, K, V,  #
-                                do, m, D,  #
-                                freqs_cos_ptr, freqs_sin_ptr,  #
-                                stride_tok, stride_d,  #
-                                stride_freqs_seq, stride_freqs_dim,  #
-                                H, N_CTX,  #
-                                BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
-                                start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
-                                MASK=True,  #
-                                )
+        dq = _attn_bwd_dq(dq, q, K, V,  #
+                          do, m, D,  #
+                          stride_tok, stride_d,  #
+                          H, N_CTX,  #
+                          BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
+                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
+                          MASK=True,  #
+                          )
         end_n -= num_steps * MASK_BLOCK_N2
+        # stage 2
         num_steps = end_n // BLOCK_N2
         start_n = end_n - num_steps * BLOCK_N2
 
-    dq1, dq2 = _attn_bwd_dq(dq1, dq2,  #
-                            q1_rot, q2_rot, K, V,  #
-                            do, m, D,  #
-                            freqs_cos_ptr, freqs_sin_ptr,  #
-                            stride_tok, stride_d,  #
-                            stride_freqs_seq, stride_freqs_dim,  #
-                            H, N_CTX,  #
-                            BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
-                            start_m, start_n, num_steps,  #
-                            MASK=False,  #
-                            )
-
-    dq1_inv = ((dq1 * cos_q + dq2 * sin_q) * LN2).to(tl.float16)
-    dq2_inv = ((dq2 * cos_q - dq1 * sin_q) * LN2).to(tl.float16)
-
-    dq1_ptrs = DQ + offs_m[:, None] * stride_tok + offs_d_first[None, :] * stride_d
-    dq2_ptrs = DQ + offs_m[:, None] * stride_tok + offs_d_second[None, :] * stride_d
-    tl.store(dq1_ptrs, dq1_inv, mask=mask_q)
-    tl.store(dq2_ptrs, dq2_inv, mask=mask_q)
+    dq = _attn_bwd_dq(dq, q, K, V,  #
+                      do, m, D,  #
+                      stride_tok, stride_d,  #
+                      H, N_CTX,  #
+                      BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
+                      start_m, start_n, num_steps,  #
+                      MASK=False,  #
+                      )
+    # Write back dQ.
+    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    dq *= LN2
+    tl.store(dq_ptrs, dq)
 
 
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, freqs_cos, freqs_sin, warp_specialize=True):
+    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -654,15 +528,19 @@ class _attention(torch.autograd.Function):
             y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
             dummy_block = [1, 1]
+            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
             if q.dtype == torch.float8_e5m2:
                 desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
                                           block_shape=dummy_block)
             else:
                 desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
                                           block_shape=dummy_block)
+            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
             desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
         else:
+            desc_q = q
             desc_v = v
+            desc_k = k
             desc_o = o
 
         def alloc_fn(size: int, align: int, _):
@@ -681,13 +559,9 @@ class _attention(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 80
         _attn_fwd[grid](
             sm_scale, M,  #
-            freqs_cos, freqs_sin,  #
-            freqs_cos.stride(0),  #
-            freqs_cos.stride(1),  #
-            q.shape[0], q.shape[1], q, k, desc_v, desc_o,  #
+            q.shape[0], q.shape[1],  #
+            desc_q, desc_k, desc_v, desc_o,  #
             N_CTX=q.shape[2],  #
-            stride_qz=q.stride(0), stride_qh=q.stride(1), stride_qm=q.stride(2), stride_qd=q.stride(3),  #
-            stride_kz=k.stride(0), stride_kh=k.stride(1), stride_km=k.stride(2), stride_kd=k.stride(3),  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
@@ -695,7 +569,7 @@ class _attention(torch.autograd.Function):
             IS_HOPPER=is_hopper(),  #
             **extra_kern_args)
 
-        ctx.save_for_backward(q, k, v, o, M, freqs_cos, freqs_sin)
+        ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
@@ -703,7 +577,7 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, M, freqs_cos, freqs_sin = ctx.saved_tensors
+        q, k, v, o, M = ctx.saved_tensors
         assert do.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
         dq = torch.empty_like(q)
@@ -731,9 +605,6 @@ class _attention(torch.autograd.Function):
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
             M, delta,  #
-            freqs_cos, freqs_sin,  #
-            freqs_cos.stride(0),  #
-            freqs_cos.stride(1),  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, N_CTX,  #
             BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
@@ -745,7 +616,7 @@ class _attention(torch.autograd.Function):
             CAUSAL=ctx.causal,  #
         )
 
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 attention = _attention.apply
@@ -771,8 +642,6 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     sm_scale = 0.5
-    freqs_cos = torch.ones((N_CTX, HEAD_DIM), dtype=torch.float16, device=DEVICE)
-    freqs_sin = torch.zeros((N_CTX, HEAD_DIM), dtype=torch.float16, device=DEVICE)
     # reference implementation
     ref_dtype = dtype
     if mode == "fwd" and "fp8" in provider:
@@ -801,7 +670,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, warp_specialize).half()
+    tri_out = attention(q, k, v, causal, sm_scale, warp_specialize).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -871,8 +740,6 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        freqs_cos = torch.ones((N_CTX, HEAD_DIM), dtype=torch.float16, device=device)
-        freqs_sin = torch.zeros((N_CTX, HEAD_DIM), dtype=torch.float16, device=device)
         if mode == "fwd" and "fp8" in provider:
             q = q.to(torch.float8_e5m2)
             k = k.to(torch.float8_e5m2)
@@ -880,7 +747,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, warp_specialize)
+        fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
