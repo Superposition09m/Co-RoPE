@@ -107,27 +107,26 @@ for start_n in tl.range(lo, hi, BLOCK_N):
 - Ours: Fused RoPE (Triton)
 
 
-| Configuration (B, H, N, D) | Pass | Baseline 1 (PyTorch SDPA) | Baseline 2 (Official)      | Baseline 3 (Triton v2)      | Fused RoPE (Ours)              | Speedup (vs B3) |
-|---------------------------|------|---------------------------|----------------------------|-----------------------------|--------------------------------|-----------------|
-| **Small-512** (4, 8, 512, 64) | FWD | 0.119ms (18.10 TFLOPS)   | 0.142ms (15.18 TFLOPS)     | 0.202ms (10.66 TFLOPS)      | **0.043ms (49.91 TFLOPS)**     | **4.68x ↑** |
-|                           | BWD  | 0.524ms (10.24 TFLOPS)   | 0.692ms (7.76 TFLOPS)      | 0.757ms (7.09 TFLOPS)       | **0.322ms (16.66 TFLOPS)**     | **2.35x ↑** |
-| **Small-1K** (4, 8, 1024, 64) | FWD | 0.168ms (51.19 TFLOPS)   | 0.167ms (51.46 TFLOPS)     | 0.207ms (41.43 TFLOPS)      | **0.050ms (171.74 TFLOPS)**    | **4.15x ↑** |
-|                           | BWD  | 0.712ms (30.15 TFLOPS)   | 0.801ms (26.80 TFLOPS)     | 0.747ms (28.76 TFLOPS)      | **0.215ms (99.75 TFLOPS)**     | **3.47x ↑** |
-| **Llama7B-2K** (2, 32, 2048, 128) | FWD | 0.807ms (170.38 TFLOPS)  | 0.789ms (174.21 TFLOPS)    | 0.709ms (193.82 TFLOPS)     | **0.381ms (360.47 TFLOPS)**    | **1.86x ↑** |
-|                              | BWD | 1.556ms (220.89 TFLOPS)  | 1.423ms (241.44 TFLOPS)    | 2.785ms (123.38 TFLOPS)     | **2.880ms (119.30 TFLOPS)**    | **0.97x ↓** |
-| **Llama7B-4K** (2, 32, 4096, 128) | FWD | 1.882ms (292.04 TFLOPS)  | 1.826ms (301.00 TFLOPS)    | 1.594ms (344.94 TFLOPS)     | **1.251ms (439.29 TFLOPS)**    | **1.27x ↑** |
-|                              | BWD | 4.057ms (338.77 TFLOPS)  | 3.725ms (369.00 TFLOPS)    | 8.434ms (162.96 TFLOPS)     | **9.474ms (145.06 TFLOPS)**    | **0.89x ↓** |
-| **Llama70B-1K** (2, 64, 1024, 128) | FWD | 0.695ms (98.93 TFLOPS)   | 0.683ms (100.55 TFLOPS)    | 0.643ms (106.91 TFLOPS)     | **0.220ms (312.36 TFLOPS)**    | **2.92x ↑** |
-|                               | BWD | 1.251ms (137.35 TFLOPS)  | 1.137ms (151.13 TFLOPS)    | 1.958ms (87.73 TFLOPS)      | **1.834ms (93.65 TFLOPS)**     | **1.07x ↑** |
-| **Long-64K** (1, 8, 65536, 128) | FWD | 27.062ms (650.07 TFLOPS) | 25.874ms (679.92 TFLOPS)   | 18.045ms (974.89 TFLOPS)    | **34.804ms (505.47 TFLOPS)**   | **0.52x ↓** |
-|                               | BWD | 71.039ms (619.10 TFLOPS) | 66.682ms (659.56 TFLOPS)   | 204.990ms (214.55 TFLOPS)   | **254.385ms (172.89 TFLOPS)**  | **0.81x ↓** |
-
+| Configuration (B, H, N, D)       | Pass | Baseline 1 (PyTorch SDPA)      | Baseline 2 (Official)           | Baseline 3 (Triton v2)           | Fused RoPE (Ours)                   | Speedup (vs B3) |
+|----------------------------------|------|--------------------------------|----------------------------------|-----------------------------------|--------------------------------------|-----------------|
+| **Small-512** (4, 8, 512, 64)    | FWD  | 0.118ms (9.08 TFLOPS)         | 0.140ms (7.66 TFLOPS)           | 0.205ms (5.23 TFLOPS)            | **0.087ms (12.32 TFLOPS)**          | **2.36x ↑**     |
+|                                  | BWD  | 0.303ms (8.87 TFLOPS)         | 0.385ms (6.98 TFLOPS)           | 0.480ms (5.59 TFLOPS)            | **0.228ms (11.79 TFLOPS)**          | **2.11x ↑**     |
+| **Small-1K** (4, 8, 1024, 64)    | FWD  | 0.191ms (22.45 TFLOPS)        | 0.255ms (16.83 TFLOPS)          | 0.345ms (12.44 TFLOPS)           | **0.089ms (48.07 TFLOPS)**          | **3.88x ↑**     |
+|                                  | BWD  | 0.545ms (19.70 TFLOPS)        | 0.367ms (29.25 TFLOPS)          | 0.233ms (46.04 TFLOPS)           | **0.148ms (72.36 TFLOPS)**          | **1.57x ↑**     |
+| **Llama7B-2K** (2, 32, 2048, 128)| FWD  | 0.810ms (84.80 TFLOPS)        | 0.792ms (86.81 TFLOPS)          | 0.711ms (96.64 TFLOPS)           | **0.370ms (185.89 TFLOPS)**         | **1.92x ↑**     |
+|                                  | BWD  | 1.559ms (110.18 TFLOPS)       | 1.423ms (120.72 TFLOPS)         | 2.789ms (61.61 TFLOPS)           | **2.883ms (59.59 TFLOPS)**          | **0.97x ↓**     |
+| **Llama7B-4K** (2, 32, 4096, 128)| FWD  | 1.885ms (145.86 TFLOPS)       | 1.824ms (150.73 TFLOPS)         | 1.586ms (173.36 TFLOPS)          | **1.215ms (226.28 TFLOPS)**         | **1.31x ↑**     |
+|                                  | BWD  | 4.059ms (169.32 TFLOPS)       | 3.728ms (184.36 TFLOPS)         | 8.442ms (81.40 TFLOPS)           | **9.470ms (72.56 TFLOPS)**          | **0.89x ↓**     |
+| **Llama70B-1K** (2, 64, 1024,128)| FWD  | 0.694ms (49.49 TFLOPS)        | 0.683ms (50.28 TFLOPS)          | 0.644ms (53.39 TFLOPS)           | **0.214ms (160.21 TFLOPS)**         | **3.01x ↑**     |
+|                                  | BWD  | 1.254ms (68.51 TFLOPS)        | 1.548ms (55.51 TFLOPS)          | 1.959ms (43.85 TFLOPS)           | **1.840ms (46.69 TFLOPS)**          | **1.06x ↑**     |
+| **Long-64K** (1, 8, 65536, 128)  | FWD  | 27.376ms (321.30 TFLOPS)      | 25.591ms (343.72 TFLOPS)        | 18.479ms (476.01 TFLOPS)         | **33.494ms (262.62 TFLOPS)**        | **0.55x ↓**     |
+|                                  | BWD  | 71.318ms (308.34 TFLOPS)      | 66.755ms (329.42 TFLOPS)        | 205.216ms (107.16 TFLOPS)        | **178.649ms (123.09 TFLOPS)**       | **1.15x ↑**     |
 **Conclusion**
-- **IO-Bound Regime (N ≤ 1024)**: Our Fused RoPE achieves a significant 2.9x – 4.6x speedup. In this regime, the kernel is limited by HBM bandwidth and kernel launch latency. By fusing the rotary transformation into the SRAM-resident tiles of Flash Attention, we eliminate the redundant R/W cycles of $Q_{rope}$ and $K_{rope}$ to global memory.
+- **IO-Bound Regime (N ≤ 1024)**: Our Fused RoPE can achieve up to 3.88x speedup. In this regime, the kernel is limited by HBM bandwidth and kernel launch latency. By fusing the rotary transformation into the SRAM-resident tiles of Flash Attention, we eliminate the redundant R/W cycles of $Q_{rope}$ and $K_{rope}$ to global memory.
 
 - **Compute-Bound Transition (N ≥ 4096)**: As sequence length increases, the attention mechanism transitions from being memory-bound to compute-bound. 
 
-- **Register Pressure and Long-Context (64K)**: In ultra-long sequences ($N=64K$), our fused implementation exhibits a performance regression (0.52x vs. B3).
+- **Register Pressure and Long-Context (64K)**: In ultra-long sequences ($N=64K$), our fused implementation exhibits a performance regression (0.55x vs. B3).
     - **Root Cause**: The addition of RoPE logic increases the Register Pressure per thread. To accommodate the rotary state, the Triton compiler may reduce the Occupancy or trigger Register Spilling, which is particularly costly in the massive loops of long-context attention.
 
 - **Backward Pass Asymmetry**: The speedup in BWD is consistently lower than FWD (max 3.47x). This is expected as the BWD pass of Flash Attention is inherently more compute-intensive (calculating gradients for $Q, K, V$), making the relative savings from memory fusion less impactful.
