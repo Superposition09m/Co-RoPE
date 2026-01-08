@@ -182,10 +182,21 @@ def prune_invalid_configs(configs, named_args, **kwargs):
 
     # Filter out configs where BLOCK_M > N_CTX
     # Filter out configs where BLOCK_M < BLOCK_N when causal is True
-    return [
+    filtered = [
         conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
     ]
+    
+    # 长序列优化：使用小 tile 降低寄存器压力，提高 occupancy
+    if N_CTX >= 8192:
+        # 过滤掉大 tile，只保留 BLOCK_M <= 64 and BLOCK_N <= 64
+        filtered = [
+            conf for conf in filtered
+            if conf.kwargs.get("BLOCK_M", 0) <= 64 
+            and conf.kwargs.get("BLOCK_N", 0) <= 64
+        ]
+    
+    return filtered
 
 
 @triton.jit
