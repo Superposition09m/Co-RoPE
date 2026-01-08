@@ -59,8 +59,45 @@ $$f(\mathbf{x}, m) = \begin{pmatrix} x_1, x_2, \cdots, x_d \end{pmatrix} \otimes
 
 ### Triton Kernel Optimization
 
+**Core Insight**: Instead of applying RoPE in separate kernels before attention, we fuse the rotation directly into the Flash Attention loop body, eliminating intermediate memory traffic.
 
+**Standard Pipeline (3 stages)**:
 
+```python
+# Kernel 1 & 2: Apply RoPE separately
+q_rope = apply_rope(q, freqs_cos, freqs_sin)  # Write to HBM
+k_rope = apply_rope(k, freqs_cos, freqs_sin)  # Write to HBM
+
+# Kernel 3: Flash Attention
+o = flash_attn(q_rope, k_rope, v)  # Read from HBM
+```
+
+**Our Fused Implementation (1 kernel)**:
+
+```python
+# In _attn_fwd (outer loop, line 266-267):
+q1_rot = (q1 * cos_q - q2 * sin_q).to(q1.dtype)  # Compute once per query block
+q2_rot = (q2 * cos_q + q1 * sin_q).to(q2.dtype)
+
+# In _attn_fwd_inner (inner loop, line 75-97):
+for start_n in tl.range(lo, hi, BLOCK_N):
+    # Load K block
+    k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
+    k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
+    
+    # Load rotation frequencies
+    cos_k = tl.load(freqs_cos_ptrs, mask=mask_k, other=1.0)
+    sin_k = tl.load(freqs_sin_ptrs, mask=mask_k, other=0.0)
+    
+    # Rotate K in registers
+    k1_rot = (k1 * cos_k - k2 * sin_k).to(q1_rot.dtype)
+    k2_rot = (k2 * cos_k + k1 * sin_k).to(q2_rot.dtype)
+    
+    # Immediately compute QK^T
+    qk = tl.dot(q1_rot, tl.trans(k1_rot))
+    qk += tl.dot(q2_rot, tl.trans(k2_rot))
+    # ... continue with softmax and attention ...
+```
 
 ### Performance Benchmark
 
