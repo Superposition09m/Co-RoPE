@@ -58,11 +58,26 @@ def benchmark_kernel(fn, warmup=25, rep=100):
     return median_time, min_time, max_time
 
 
-def compute_flops(B, H, N, D, time_ms, mode='fwd'):
-    """计算 FLOPS"""
-    # Forward: 2 次矩阵乘法，每次 2*B*H*N*N*D FLOPs
+def compute_flops(B, H, N, D, time_ms, mode='fwd', causal=False):
+    """
+    计算 FLOPS
+    
+    Args:
+        B: batch size
+        H: number of heads
+        N: sequence length
+        D: head dimension
+        time_ms: execution time in milliseconds
+        mode: 'fwd' or 'bwd'
+        causal: whether using causal masking (reduces FLOPs by ~0.5x)
+    """
+    # Forward: 2 次矩阵乘法 (QK^T 和 PV)，每次 2*B*H*N*N*D FLOPs
     flops_per_matmul = 2.0 * B * H * N * N * D
     total_flops = 2 * flops_per_matmul
+    
+    # Causal masking 只计算下三角，约 0.5x FLOPs
+    if causal:
+        total_flops *= 0.5
     
     if mode == 'bwd':
         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
@@ -221,7 +236,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100, t
     
     try:
         median, min_t, max_t = benchmark_kernel(fn_baseline1, warmup=warmup, rep=rep)
-        tflops = compute_flops(B, H, N, D, median, mode)
+        tflops = compute_flops(B, H, N, D, median, mode, causal)
         results['baseline1'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
     except Exception as e:
@@ -240,7 +255,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100, t
     
     try:
         median, min_t, max_t = benchmark_kernel(fn_baseline2, warmup=warmup, rep=rep)
-        tflops = compute_flops(B, H, N, D, median, mode)
+        tflops = compute_flops(B, H, N, D, median, mode, causal)
         results['baseline2'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
     except Exception as e:
@@ -259,7 +274,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100, t
     
     try:
         median, min_t, max_t = benchmark_kernel(fn_baseline3, warmup=warmup, rep=rep)
-        tflops = compute_flops(B, H, N, D, median, mode)
+        tflops = compute_flops(B, H, N, D, median, mode, causal)
         results['baseline3'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
     except Exception as e:
@@ -278,7 +293,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100, t
     
     try:
         median, min_t, max_t = benchmark_kernel(fn_fused, warmup=warmup, rep=rep)
-        tflops = compute_flops(B, H, N, D, median, mode)
+        tflops = compute_flops(B, H, N, D, median, mode, causal)
         results['fused'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
     except Exception as e:
@@ -295,6 +310,12 @@ def main():
     print("Baseline 2: Transformers RoPE + Flash Attention (Official CUDA)")
     print("Baseline 3: Transformers RoPE + Flash Attention v2 (Triton - 无RoPE融合)")
     print("Fused RoPE: 我们的 Triton 实现（RoPE 融合进 Flash Attention）")
+    print("="*80)
+    print("\n⚠️  FLOPS计算说明：")
+    print("  - 只计算 QK^T 和 PV 两次矩阵乘法的 FLOPs: 4*B*H*N^2*D")
+    print("  - Causal masking 时乘以 0.5 (只计算下三角)")
+    print("  - RoPE 旋转操作的 FLOPs 未包含 (相对 N^2 来说很小)")
+    print("  - Backward pass 使用 2.5x forward FLOPs (标准估计)")
     print("="*80)
     
     # 测试配置：(BATCH, H, N_CTX, HEAD_DIM, causal, name)
@@ -364,20 +385,20 @@ def main():
         print(f"\n[配置: {name}] B={B}, H={H}, N={N}, D={D}")
         
         # 根据序列长度动态调整测试次数（使用 Triton benchmark）
-        # warmup: 确保 autotune 完成
+        # warmup: 确保 autotune 完成和kernel充分优化
         # rep: 测量次数
         if N >= 262144:
-            warmup, rep = 10, 20   # 256K+ 测试少一点
+            warmup, rep = 20, 30   # 256K+ 测试少一点
         elif N >= 131072:
-            warmup, rep = 15, 30   # 128K
+            warmup, rep = 25, 50   # 128K
         elif N >= 65536:
-            warmup, rep = 20, 50   # 64K
+            warmup, rep = 50, 100  # 64K
         elif N >= 32768:
-            warmup, rep = 25, 75   # 32K
+            warmup, rep = 50, 150  # 32K
         elif N >= 8192:
-            warmup, rep = 25, 100  # 8K-16K
+            warmup, rep = 100, 200  # 8K-16K
         else:
-            warmup, rep = 25, 100  # ≤4K 标准测试
+            warmup, rep = 100, 300  # ≤4K 标准测试（增加warmup避免小batch时的不稳定）
         
         print(f"  (Warmup={warmup}, Rep={rep}, 使用 Triton do_bench)")
         
@@ -482,17 +503,17 @@ def main():
         
         # 根据序列长度动态调整测试次数
         if N >= 262144:
-            warmup, rep = 10, 20
+            warmup, rep = 20, 30
         elif N >= 131072:
-            warmup, rep = 15, 30
+            warmup, rep = 25, 50
         elif N >= 65536:
-            warmup, rep = 20, 50
+            warmup, rep = 50, 100
         elif N >= 32768:
-            warmup, rep = 25, 75
+            warmup, rep = 50, 150
         elif N >= 8192:
-            warmup, rep = 25, 100
+            warmup, rep = 100, 200
         else:
-            warmup, rep = 25, 100
+            warmup, rep = 100, 300  # 增加warmup避免小batch时的不稳定
         
         print(f"  (Warmup={warmup}, Rep={rep}, 使用 Triton do_bench)")
         
