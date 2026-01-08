@@ -129,7 +129,7 @@ for start_n in tl.range(lo, hi, BLOCK_N):
 - **Register Pressure and Long-Context (64K)**: In ultra-long sequences ($N=64K$), our fused implementation exhibits a performance regression (0.55x vs. B3).
     - **Root Cause**: The addition of RoPE logic increases the Register Pressure per thread. To accommodate the rotary state, the Triton compiler may reduce the Occupancy or trigger Register Spilling, which is particularly costly in the massive loops of long-context attention.
 
-- **Backward Pass Asymmetry**: The speedup in BWD is consistently lower than FWD (max 3.47x). This is expected as the BWD pass of Flash Attention is inherently more compute-intensive (calculating gradients for $Q, K, V$), making the relative savings from memory fusion less impactful.
+- **Backward Pass Asymmetry**: The speedup in BWD is consistently lower than FWD (max 2.11x). This is expected as the BWD pass of Flash Attention is inherently more compute-intensive (calculating gradients for $Q, K, V$), making the relative savings from memory fusion less impactful.
 
 ## Co-RoPE (Experimental)
 Co-RoPE is a context-aware improvement of RoPE.
