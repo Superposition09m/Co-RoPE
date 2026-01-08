@@ -1,9 +1,10 @@
 """
-Flash Attention v2 原版 vs Fused RoPE 性能对比
-测试三个版本的 FLOPS：
-1. Flash Attention v2 原版（无 RoPE）
-2. Fused RoPE v2（最小化修改版本）
-3. Fused RoPE（过度优化版本）
+RoPE Attention 性能对比
+测试四个版本：
+1. Baseline 1: Transformers RoPE + PyTorch SDPA
+2. Baseline 2: Transformers RoPE + Flash Attention (Official CUDA)
+3. Baseline 3: Transformers RoPE + Flash Attention v2 (Triton - 无RoPE融合)
+4. Fused RoPE: 我们的 Triton 实现（RoPE 融合进 Flash Attention）
 
 ⚠️ 重要：使用 Triton 官方的 triton.testing.do_bench 进行 benchmark
    - 正确处理 autotune（第一次调用时完成配置选择）
@@ -20,9 +21,9 @@ import triton
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # 添加上一层目录
 
-from flash_attn_v2_triton import attention as attention_v2
-from flash_attn_rope_v2_triton import attention as attention_rope_v2
-from flash_attn_rope_opt_triton import attention as attention_rope_opt
+from baseline import baseline1_rope_pytorch_attn, baseline2_rope_flashattn, baseline3_rope_flashattn_triton
+from fused_rope_attn import attention as fused_rope_attn
+from rope_attn_pytorch import precompute_freqs_cis
 from utils import calc_sim, assert_similar, print_red_warning
 
 
@@ -70,7 +71,7 @@ def compute_flops(B, H, N, D, time_ms, mode='fwd'):
     return tflops
 
 
-def test_correctness(B, H, N, D, causal=False, test_backward=False):
+def test_correctness(B, H, N, D, causal=False, test_backward=False, theta=10000.0):
     """测试正确性（Forward + Backward）"""
     mode_str = "Forward + Backward" if test_backward else "Forward Only"
     print(f"\n{'='*80}")
@@ -84,69 +85,105 @@ def test_correctness(B, H, N, D, causal=False, test_backward=False):
     q = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=test_backward)
     k = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=test_backward)
     v = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=test_backward)
-    freqs_cos = torch.randn(N, D // 2, device=device, dtype=dtype)
-    freqs_sin = torch.randn(N, D // 2, device=device, dtype=dtype)
+    
+    # Compute RoPE frequencies
+    freqs_cos, freqs_sin = precompute_freqs_cis(D, N, theta, device=device)
     sm_scale = 0.5
     
-    # Flash v2 原版（不带 RoPE）
-    print("\n[1. Flash v2 原版]")
-    o_v2 = attention_v2(q, k, v, causal, sm_scale, False)
-    print(f"  Forward Output: mean={o_v2.mean().item():.6f}, std={o_v2.std().item():.6f}")
-    
-    if test_backward:
-        dout = torch.randn_like(o_v2)
-        o_v2.backward(dout, retain_graph=True)
-        dq_v2, dk_v2, dv_v2 = q.grad.clone(), k.grad.clone(), v.grad.clone()
-        q.grad, k.grad, v.grad = None, None, None
-        print(f"  Backward dq: mean={dq_v2.mean().item():.6f}, std={dq_v2.std().item():.6f}")
-    
-    # Fused RoPE v2（最小化修改版本）
-    print("\n[2. Fused RoPE v2 (Minimal Change)]")
+    # Baseline 1: Transformers RoPE + PyTorch SDPA
+    print("\n[1. Baseline 1: Transformers RoPE + PyTorch SDPA]")
     try:
-        o_rope_v2 = attention_rope_v2(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
-        if torch.isnan(o_rope_v2).any() or torch.isinf(o_rope_v2).any():
+        o_baseline1 = baseline1_rope_pytorch_attn(q, k, v, causal, sm_scale, theta)
+        if torch.isnan(o_baseline1).any() or torch.isinf(o_baseline1).any():
             print(f"  ❌ Forward 输出包含 NaN/Inf")
             return False
-        print(f"  ✅ Forward Output: mean={o_rope_v2.mean().item():.6f}, std={o_rope_v2.std().item():.6f}")
+        print(f"  ✅ Forward Output: mean={o_baseline1.mean().item():.6f}, std={o_baseline1.std().item():.6f}")
         
         if test_backward:
-            o_rope_v2.backward(dout, retain_graph=True)
-            dq_rope_v2 = q.grad.clone()
+            dout = torch.randn_like(o_baseline1)
+            o_baseline1.backward(dout, retain_graph=True)
+            dq_baseline1 = q.grad.clone()
             q.grad, k.grad, v.grad = None, None, None
-            if torch.isnan(dq_rope_v2).any() or torch.isinf(dq_rope_v2).any():
+            if torch.isnan(dq_baseline1).any() or torch.isinf(dq_baseline1).any():
                 print(f"  ❌ Backward 梯度包含 NaN/Inf")
                 return False
-            print(f"  ✅ Backward dq: mean={dq_rope_v2.mean().item():.6f}, std={dq_rope_v2.std().item():.6f}")
+            print(f"  ✅ Backward dq: mean={dq_baseline1.mean().item():.6f}, std={dq_baseline1.std().item():.6f}")
     except Exception as e:
         print(f"  ❌ 失败: {str(e)[:100]}")
         return False
     
-    # Fused RoPE（过度优化版本）
-    print("\n[3. Fused RoPE (Over-Optimized)]")
+    # Baseline 2: Transformers RoPE + Flash Attention (Official CUDA)
+    print("\n[2. Baseline 2: Transformers RoPE + Flash Attention Official]")
     try:
-        o_rope_opt = attention_rope_opt(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
-        if torch.isnan(o_rope_opt).any() or torch.isinf(o_rope_opt).any():
+        o_baseline2 = baseline2_rope_flashattn(q, k, v, causal, sm_scale, theta)
+        if torch.isnan(o_baseline2).any() or torch.isinf(o_baseline2).any():
             print(f"  ❌ Forward 输出包含 NaN/Inf")
             return False
-        print(f"  ✅ Forward Output: mean={o_rope_opt.mean().item():.6f}, std={o_rope_opt.std().item():.6f}")
+        print(f"  ✅ Forward Output: mean={o_baseline2.mean().item():.6f}, std={o_baseline2.std().item():.6f}")
         
         if test_backward:
-            o_rope_opt.backward(dout, retain_graph=True)
-            dq_rope_opt = q.grad.clone()
+            o_baseline2.backward(dout, retain_graph=True)
+            dq_baseline2 = q.grad.clone()
             q.grad, k.grad, v.grad = None, None, None
-            if torch.isnan(dq_rope_opt).any() or torch.isinf(dq_rope_opt).any():
+            if torch.isnan(dq_baseline2).any() or torch.isinf(dq_baseline2).any():
                 print(f"  ❌ Backward 梯度包含 NaN/Inf")
                 return False
-            print(f"  ✅ Backward dq: mean={dq_rope_opt.mean().item():.6f}, std={dq_rope_opt.std().item():.6f}")
+            print(f"  ✅ Backward dq: mean={dq_baseline2.mean().item():.6f}, std={dq_baseline2.std().item():.6f}")
     except Exception as e:
         print(f"  ❌ 失败: {str(e)[:100]}")
+        return False
+    
+    # Baseline 3: Transformers RoPE + Flash Attention v2 (Triton - 无RoPE融合)
+    print("\n[3. Baseline 3: Transformers RoPE + Flash Attention v2 Triton]")
+    try:
+        o_baseline3 = baseline3_rope_flashattn_triton(q, k, v, causal, sm_scale, theta)
+        if torch.isnan(o_baseline3).any() or torch.isinf(o_baseline3).any():
+            print(f"  ❌ Forward 输出包含 NaN/Inf")
+            return False
+        print(f"  ✅ Forward Output: mean={o_baseline3.mean().item():.6f}, std={o_baseline3.std().item():.6f}")
+        
+        if test_backward:
+            o_baseline3.backward(dout, retain_graph=True)
+            dq_baseline3 = q.grad.clone()
+            q.grad, k.grad, v.grad = None, None, None
+            if torch.isnan(dq_baseline3).any() or torch.isinf(dq_baseline3).any():
+                print(f"  ❌ Backward 梯度包含 NaN/Inf")
+                return False
+            print(f"  ✅ Backward dq: mean={dq_baseline3.mean().item():.6f}, std={dq_baseline3.std().item():.6f}")
+    except Exception as e:
+        print(f"  ❌ 失败: {str(e)[:100]}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Fused RoPE: 我们的 Triton 实现
+    print("\n[4. Fused RoPE: Triton Implementation]")
+    try:
+        o_fused = fused_rope_attn(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
+        if torch.isnan(o_fused).any() or torch.isinf(o_fused).any():
+            print(f"  ❌ Forward 输出包含 NaN/Inf")
+            return False
+        print(f"  ✅ Forward Output: mean={o_fused.mean().item():.6f}, std={o_fused.std().item():.6f}")
+        
+        if test_backward:
+            o_fused.backward(dout, retain_graph=True)
+            dq_fused = q.grad.clone()
+            q.grad, k.grad, v.grad = None, None, None
+            if torch.isnan(dq_fused).any() or torch.isinf(dq_fused).any():
+                print(f"  ❌ Backward 梯度包含 NaN/Inf")
+                return False
+            print(f"  ✅ Backward dq: mean={dq_fused.mean().item():.6f}, std={dq_fused.std().item():.6f}")
+    except Exception as e:
+        print(f"  ❌ 失败: {str(e)[:100]}")
+        import traceback
+        traceback.print_exc()
         return False
     
     print(f"\n✅ 所有版本数值稳定性验证通过（无 NaN/Inf）")
     return True
 
 
-def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100):
+def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100, theta=10000.0):
     """
     性能测试三个版本（使用 Triton 官方 benchmark，正确处理 autotune）
     
@@ -154,6 +191,7 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100):
         mode: 'fwd' 或 'bwd'
         warmup: Warmup iterations（默认 25，确保 autotune 完成）
         rep: Measurement iterations（默认 100）
+        theta: RoPE base frequency
     """
     device = 'cuda'
     dtype = torch.float16
@@ -164,75 +202,99 @@ def test_performance(B, H, N, D, causal=False, mode='fwd', warmup=25, rep=100):
     q = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=requires_grad)
     k = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=requires_grad)
     v = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=requires_grad)
-    freqs_cos = torch.randn(N, D // 2, device=device, dtype=dtype)
-    freqs_sin = torch.randn(N, D // 2, device=device, dtype=dtype)
+    
+    # Compute RoPE frequencies
+    freqs_cos, freqs_sin = precompute_freqs_cis(D, N, theta, device=device)
     sm_scale = 0.5
     
     results = {}
     
-    # 1. Flash v2 原版
-    print("\n  [1. Flash v2 原版]", end=' ', flush=True)
+    # 1. Baseline 1: Transformers RoPE + PyTorch SDPA
+    print("\n  [1. Baseline 1: Transformers RoPE + PyTorch SDPA]", end=' ', flush=True)
     
     if mode == 'fwd':
-        fn_v2 = lambda: attention_v2(q, k, v, causal, sm_scale, False)
+        fn_baseline1 = lambda: baseline1_rope_pytorch_attn(q, k, v, causal, sm_scale, theta)
     else:  # bwd
-        o_v2 = attention_v2(q, k, v, causal, sm_scale, False)
-        dout_v2 = torch.randn_like(o_v2)
-        fn_v2 = lambda: o_v2.backward(dout_v2, retain_graph=True)
+        o_baseline1 = baseline1_rope_pytorch_attn(q, k, v, causal, sm_scale, theta)
+        dout_baseline1 = torch.randn_like(o_baseline1)
+        fn_baseline1 = lambda: o_baseline1.backward(dout_baseline1, retain_graph=True)
     
     try:
-        median, min_t, max_t = benchmark_kernel(fn_v2, warmup=warmup, rep=rep)
+        median, min_t, max_t = benchmark_kernel(fn_baseline1, warmup=warmup, rep=rep)
         tflops = compute_flops(B, H, N, D, median, mode)
-        results['v2'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
+        results['baseline1'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
     except Exception as e:
         print(f"❌ {str(e)[:50]}")
-        results['v2'] = None
+        results['baseline1'] = None
     
-    # 2. Fused RoPE v2（最小化修改）
-    print("  [2. Fused RoPE v2]", end=' ', flush=True)
+    # 2. Baseline 2: Transformers RoPE + Flash Attention (Official CUDA)
+    print("  [2. Baseline 2: Transformers RoPE + Flash Attn Official]", end=' ', flush=True)
     
     if mode == 'fwd':
-        fn_rope_v2 = lambda: attention_rope_v2(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
+        fn_baseline2 = lambda: baseline2_rope_flashattn(q, k, v, causal, sm_scale, theta)
     else:  # bwd
-        o_rope_v2 = attention_rope_v2(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
-        dout_rope_v2 = torch.randn_like(o_rope_v2)
-        fn_rope_v2 = lambda: o_rope_v2.backward(dout_rope_v2, retain_graph=True)
+        o_baseline2 = baseline2_rope_flashattn(q, k, v, causal, sm_scale, theta)
+        dout_baseline2 = torch.randn_like(o_baseline2)
+        fn_baseline2 = lambda: o_baseline2.backward(dout_baseline2, retain_graph=True)
     
     try:
-        median, min_t, max_t = benchmark_kernel(fn_rope_v2, warmup=warmup, rep=rep)
+        median, min_t, max_t = benchmark_kernel(fn_baseline2, warmup=warmup, rep=rep)
         tflops = compute_flops(B, H, N, D, median, mode)
-        results['rope_v2'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
+        results['baseline2'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
     except Exception as e:
         print(f"❌ {str(e)[:50]}")
-        results['rope_v2'] = None
+        results['baseline2'] = None
     
-    # 3. Fused RoPE（过度优化）
-    print("  [3. Fused RoPE Opt]", end=' ', flush=True)
+    # 3. Baseline 3: Transformers RoPE + Flash Attention v2 (Triton - 无RoPE融合)
+    print("  [3. Baseline 3: Transformers RoPE + Flash Attn v2 Triton]", end=' ', flush=True)
     
     if mode == 'fwd':
-        fn_rope_opt = lambda: attention_rope_opt(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
+        fn_baseline3 = lambda: baseline3_rope_flashattn_triton(q, k, v, causal, sm_scale, theta)
     else:  # bwd
-        o_rope_opt = attention_rope_opt(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
-        dout_rope_opt = torch.randn_like(o_rope_opt)
-        fn_rope_opt = lambda: o_rope_opt.backward(dout_rope_opt, retain_graph=True)
+        o_baseline3 = baseline3_rope_flashattn_triton(q, k, v, causal, sm_scale, theta)
+        dout_baseline3 = torch.randn_like(o_baseline3)
+        fn_baseline3 = lambda: o_baseline3.backward(dout_baseline3, retain_graph=True)
     
     try:
-        median, min_t, max_t = benchmark_kernel(fn_rope_opt, warmup=warmup, rep=rep)
+        median, min_t, max_t = benchmark_kernel(fn_baseline3, warmup=warmup, rep=rep)
         tflops = compute_flops(B, H, N, D, median, mode)
-        results['rope_opt'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
+        results['baseline3'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
         print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
     except Exception as e:
         print(f"❌ {str(e)[:50]}")
-        results['rope_opt'] = None
+        results['baseline3'] = None
+    
+    # 4. Fused RoPE: 我们的 Triton 实现
+    print("  [4. Fused RoPE: Triton (RoPE融合)]", end=' ', flush=True)
+    
+    if mode == 'fwd':
+        fn_fused = lambda: fused_rope_attn(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
+    else:  # bwd
+        o_fused = fused_rope_attn(q, k, v, causal, sm_scale, freqs_cos, freqs_sin, False)
+        dout_fused = torch.randn_like(o_fused)
+        fn_fused = lambda: o_fused.backward(dout_fused, retain_graph=True)
+    
+    try:
+        median, min_t, max_t = benchmark_kernel(fn_fused, warmup=warmup, rep=rep)
+        tflops = compute_flops(B, H, N, D, median, mode)
+        results['fused'] = {'median': median, 'min': min_t, 'max': max_t, 'tflops': tflops}
+        print(f"{median:.3f} ms ({tflops:.2f} TFLOPS)")
+    except Exception as e:
+        print(f"❌ {str(e)[:50]}")
+        results['fused'] = None
     
     return results
 
 
 def main():
     print("="*80)
-    print("三版本性能对比: Flash v2 | RoPE v2 (Minimal) | RoPE Opt")
+    print("RoPE Attention 性能对比")
+    print("Baseline 1: Transformers RoPE + PyTorch SDPA")
+    print("Baseline 2: Transformers RoPE + Flash Attention (Official CUDA)")
+    print("Baseline 3: Transformers RoPE + Flash Attention v2 (Triton - 无RoPE融合)")
+    print("Fused RoPE: 我们的 Triton 实现（RoPE 融合进 Flash Attention）")
     print("="*80)
     
     # 测试配置：(BATCH, H, N_CTX, HEAD_DIM, causal, name)
@@ -327,69 +389,84 @@ def main():
             print(f"  ❌ 失败: {e}")
     
     # Forward 总结
-    print("\n" + "="*100)
+    print("\n" + "="*120)
     print("性能对比总结 (Forward Pass)")
-    print("="*100)
-    print(f"{'配置':<10} | {'v2 Time':<10} | {'RoPE v2':<10} | {'RoPE Opt':<11} | {'v2 TFLOPS':<10} | {'RoPEv2 TF':<10} | {'Opt TF':<10}")
-    print("-"*100)
+    print("="*120)
+    print(f"{'配置':<10} | {'Baseline1':<11} | {'Baseline2':<11} | {'Baseline3':<11} | {'Fused':<11} | {'B1 TF':<7} | {'B2 TF':<7} | {'B3 TF':<7} | {'Fused TF':<8}")
+    print("-"*120)
     
     for result in all_fwd_results:
-        if result.get('v2'):
+        if result.get('baseline1') or result.get('baseline2') or result.get('baseline3') or result.get('fused'):
             name = result['config']
-            v2_t = result['v2']['median']
-            v2_tflops = result['v2']['tflops']
             
-            rope_v2_t = result.get('rope_v2', {}).get('median', 0)
-            rope_v2_tflops = result.get('rope_v2', {}).get('tflops', 0)
+            baseline1_t = result.get('baseline1', {}).get('median', 0)
+            baseline1_tflops = result.get('baseline1', {}).get('tflops', 0)
             
-            rope_opt_t = result.get('rope_opt', {}).get('median', 0)
-            rope_opt_tflops = result.get('rope_opt', {}).get('tflops', 0)
+            baseline2_t = result.get('baseline2', {}).get('median', 0)
+            baseline2_tflops = result.get('baseline2', {}).get('tflops', 0)
             
-            v2_str = f"{v2_t:.2f}ms" if v2_t > 0 else "N/A"
-            v2_rope_str = f"{rope_v2_t:.2f}ms" if rope_v2_t > 0 else "N/A"
-            opt_str = f"{rope_opt_t:.2f}ms" if rope_opt_t > 0 else "N/A"
+            baseline3_t = result.get('baseline3', {}).get('median', 0)
+            baseline3_tflops = result.get('baseline3', {}).get('tflops', 0)
             
-            print(f"{name:<10} | {v2_str:<10} | {v2_rope_str:<10} | {opt_str:<11} | {v2_tflops:>9.2f}  | {rope_v2_tflops:>9.2f}  | {rope_opt_tflops:>9.2f}")
+            fused_t = result.get('fused', {}).get('median', 0)
+            fused_tflops = result.get('fused', {}).get('tflops', 0)
+            
+            b1_str = f"{baseline1_t:.2f}ms" if baseline1_t > 0 else "N/A"
+            b2_str = f"{baseline2_t:.2f}ms" if baseline2_t > 0 else "N/A"
+            b3_str = f"{baseline3_t:.2f}ms" if baseline3_t > 0 else "N/A"
+            fused_str = f"{fused_t:.2f}ms" if fused_t > 0 else "N/A"
+            
+            print(f"{name:<10} | {b1_str:<11} | {b2_str:<11} | {b3_str:<11} | {fused_str:<11} | {baseline1_tflops:>6.2f}  | {baseline2_tflops:>6.2f}  | {baseline3_tflops:>6.2f}  | {fused_tflops:>7.2f}")
     
-    print("="*100)
+    print("="*120)
     
-    # Forward 性能差异分析
-    print("\n" + "="*100)
-    print("Forward 性能差异分析（相对于 Flash v2 原版）")
-    print("="*100)
-    print(f"{'配置':<10} | {'RoPE v2 Speedup':<18} | {'RoPE Opt Speedup':<19} | {'RoPE v2 TFLOPS Δ':<18} | {'Opt TFLOPS Δ'}")
-    print("-"*100)
+    # Forward 性能差异分析（以 Baseline 3 为基准）
+    print("\n" + "="*130)
+    print("Forward 性能差异分析（相对于 Baseline 3: Flash Attention v2 Triton 无RoPE融合）")
+    print("="*130)
+    print(f"{'配置':<10} | {'B1 vs B3':<18} | {'B2 vs B3':<18} | {'Fused vs B3':<18} | {'B1 TFLOPS Δ':<15} | {'B2 TFLOPS Δ':<15} | {'Fused TFLOPS Δ':<15}")
+    print("-"*130)
     
     for result in all_fwd_results:
-        if result.get('v2'):
+        if result.get('baseline3'):
             name = result['config']
-            v2_t = result['v2']['median']
-            v2_tflops = result['v2']['tflops']
+            b3_t = result['baseline3']['median']
+            b3_tflops = result['baseline3']['tflops']
             
-            rope_v2_data = result.get('rope_v2', {})
-            rope_opt_data = result.get('rope_opt', {})
+            baseline1_data = result.get('baseline1', {})
+            baseline2_data = result.get('baseline2', {})
+            fused_data = result.get('fused', {})
             
-            if rope_v2_data and rope_v2_data.get('median'):
-                speedup_v2 = v2_t / rope_v2_data['median']
-                tflops_diff_v2 = rope_v2_data['tflops'] - v2_tflops
-                speedup_v2_str = f"{speedup_v2:.3f}x {'↑' if speedup_v2 > 1 else '↓'}"
-                tflops_v2_str = f"{tflops_diff_v2:+.2f}"
+            if baseline1_data and baseline1_data.get('median'):
+                speedup_b1 = b3_t / baseline1_data['median']
+                tflops_diff_b1 = baseline1_data['tflops'] - b3_tflops
+                speedup_b1_str = f"{speedup_b1:.3f}x {'↑' if speedup_b1 > 1 else '↓'}"
+                tflops_b1_str = f"{tflops_diff_b1:+.2f}"
             else:
-                speedup_v2_str = "N/A"
-                tflops_v2_str = "N/A"
+                speedup_b1_str = "N/A"
+                tflops_b1_str = "N/A"
             
-            if rope_opt_data and rope_opt_data.get('median'):
-                speedup_opt = v2_t / rope_opt_data['median']
-                tflops_diff_opt = rope_opt_data['tflops'] - v2_tflops
-                speedup_opt_str = f"{speedup_opt:.3f}x {'↑' if speedup_opt > 1 else '↓'}"
-                tflops_opt_str = f"{tflops_diff_opt:+.2f}"
+            if baseline2_data and baseline2_data.get('median'):
+                speedup_b2 = b3_t / baseline2_data['median']
+                tflops_diff_b2 = baseline2_data['tflops'] - b3_tflops
+                speedup_b2_str = f"{speedup_b2:.3f}x {'↑' if speedup_b2 > 1 else '↓'}"
+                tflops_b2_str = f"{tflops_diff_b2:+.2f}"
             else:
-                speedup_opt_str = "N/A"
-                tflops_opt_str = "N/A"
+                speedup_b2_str = "N/A"
+                tflops_b2_str = "N/A"
             
-            print(f"{name:<10} | {speedup_v2_str:<18} | {speedup_opt_str:<19} | {tflops_v2_str:<18} | {tflops_opt_str}")
+            if fused_data and fused_data.get('median'):
+                speedup_fused = b3_t / fused_data['median']
+                tflops_diff_fused = fused_data['tflops'] - b3_tflops
+                speedup_fused_str = f"{speedup_fused:.3f}x {'↑' if speedup_fused > 1 else '↓'}"
+                tflops_fused_str = f"{tflops_diff_fused:+.2f}"
+            else:
+                speedup_fused_str = "N/A"
+                tflops_fused_str = "N/A"
+            
+            print(f"{name:<10} | {speedup_b1_str:<18} | {speedup_b2_str:<18} | {speedup_fused_str:<18} | {tflops_b1_str:<15} | {tflops_b2_str:<15} | {tflops_fused_str}")
     
-    print("="*100)
+    print("="*130)
     
     # ===================================================================================
     # Backward Pass 性能测试
@@ -427,69 +504,84 @@ def main():
             print(f"  ❌ 失败: {e}")
     
     # Backward 总结
-    print("\n" + "="*100)
+    print("\n" + "="*120)
     print("性能对比总结 (Backward Pass)")
-    print("="*100)
-    print(f"{'配置':<10} | {'v2 Time':<10} | {'RoPE v2':<10} | {'RoPE Opt':<11} | {'v2 TFLOPS':<10} | {'RoPEv2 TF':<10} | {'Opt TF':<10}")
-    print("-"*100)
+    print("="*120)
+    print(f"{'配置':<10} | {'Baseline1':<11} | {'Baseline2':<11} | {'Baseline3':<11} | {'Fused':<11} | {'B1 TF':<7} | {'B2 TF':<7} | {'B3 TF':<7} | {'Fused TF':<8}")
+    print("-"*120)
     
     for result in all_bwd_results:
-        if result.get('v2'):
+        if result.get('baseline1') or result.get('baseline2') or result.get('baseline3') or result.get('fused'):
             name = result['config']
-            v2_t = result['v2']['median']
-            v2_tflops = result['v2']['tflops']
             
-            rope_v2_t = result.get('rope_v2', {}).get('median', 0)
-            rope_v2_tflops = result.get('rope_v2', {}).get('tflops', 0)
+            baseline1_t = result.get('baseline1', {}).get('median', 0)
+            baseline1_tflops = result.get('baseline1', {}).get('tflops', 0)
             
-            rope_opt_t = result.get('rope_opt', {}).get('median', 0)
-            rope_opt_tflops = result.get('rope_opt', {}).get('tflops', 0)
+            baseline2_t = result.get('baseline2', {}).get('median', 0)
+            baseline2_tflops = result.get('baseline2', {}).get('tflops', 0)
             
-            v2_str = f"{v2_t:.2f}ms" if v2_t > 0 else "N/A"
-            v2_rope_str = f"{rope_v2_t:.2f}ms" if rope_v2_t > 0 else "N/A"
-            opt_str = f"{rope_opt_t:.2f}ms" if rope_opt_t > 0 else "N/A"
+            baseline3_t = result.get('baseline3', {}).get('median', 0)
+            baseline3_tflops = result.get('baseline3', {}).get('tflops', 0)
             
-            print(f"{name:<10} | {v2_str:<10} | {v2_rope_str:<10} | {opt_str:<11} | {v2_tflops:>9.2f}  | {rope_v2_tflops:>9.2f}  | {rope_opt_tflops:>9.2f}")
+            fused_t = result.get('fused', {}).get('median', 0)
+            fused_tflops = result.get('fused', {}).get('tflops', 0)
+            
+            b1_str = f"{baseline1_t:.2f}ms" if baseline1_t > 0 else "N/A"
+            b2_str = f"{baseline2_t:.2f}ms" if baseline2_t > 0 else "N/A"
+            b3_str = f"{baseline3_t:.2f}ms" if baseline3_t > 0 else "N/A"
+            fused_str = f"{fused_t:.2f}ms" if fused_t > 0 else "N/A"
+            
+            print(f"{name:<10} | {b1_str:<11} | {b2_str:<11} | {b3_str:<11} | {fused_str:<11} | {baseline1_tflops:>6.2f}  | {baseline2_tflops:>6.2f}  | {baseline3_tflops:>6.2f}  | {fused_tflops:>7.2f}")
     
-    print("="*100)
+    print("="*120)
     
-    # Backward 性能差异分析
-    print("\n" + "="*100)
-    print("Backward 性能差异分析（相对于 Flash v2 原版）")
-    print("="*100)
-    print(f"{'配置':<10} | {'RoPE v2 Speedup':<18} | {'RoPE Opt Speedup':<19} | {'RoPE v2 TFLOPS Δ':<18} | {'Opt TFLOPS Δ'}")
-    print("-"*100)
+    # Backward 性能差异分析（以 Baseline 3 为基准）
+    print("\n" + "="*130)
+    print("Backward 性能差异分析（相对于 Baseline 3: Flash Attention v2 Triton 无RoPE融合）")
+    print("="*130)
+    print(f"{'配置':<10} | {'B1 vs B3':<18} | {'B2 vs B3':<18} | {'Fused vs B3':<18} | {'B1 TFLOPS Δ':<15} | {'B2 TFLOPS Δ':<15} | {'Fused TFLOPS Δ':<15}")
+    print("-"*130)
     
     for result in all_bwd_results:
-        if result.get('v2'):
+        if result.get('baseline3'):
             name = result['config']
-            v2_t = result['v2']['median']
-            v2_tflops = result['v2']['tflops']
+            b3_t = result['baseline3']['median']
+            b3_tflops = result['baseline3']['tflops']
             
-            rope_v2_data = result.get('rope_v2', {})
-            rope_opt_data = result.get('rope_opt', {})
+            baseline1_data = result.get('baseline1', {})
+            baseline2_data = result.get('baseline2', {})
+            fused_data = result.get('fused', {})
             
-            if rope_v2_data and rope_v2_data.get('median'):
-                speedup_v2 = v2_t / rope_v2_data['median']
-                tflops_diff_v2 = rope_v2_data['tflops'] - v2_tflops
-                speedup_v2_str = f"{speedup_v2:.3f}x {'↑' if speedup_v2 > 1 else '↓'}"
-                tflops_v2_str = f"{tflops_diff_v2:+.2f}"
+            if baseline1_data and baseline1_data.get('median'):
+                speedup_b1 = b3_t / baseline1_data['median']
+                tflops_diff_b1 = baseline1_data['tflops'] - b3_tflops
+                speedup_b1_str = f"{speedup_b1:.3f}x {'↑' if speedup_b1 > 1 else '↓'}"
+                tflops_b1_str = f"{tflops_diff_b1:+.2f}"
             else:
-                speedup_v2_str = "N/A"
-                tflops_v2_str = "N/A"
+                speedup_b1_str = "N/A"
+                tflops_b1_str = "N/A"
             
-            if rope_opt_data and rope_opt_data.get('median'):
-                speedup_opt = v2_t / rope_opt_data['median']
-                tflops_diff_opt = rope_opt_data['tflops'] - v2_tflops
-                speedup_opt_str = f"{speedup_opt:.3f}x {'↑' if speedup_opt > 1 else '↓'}"
-                tflops_opt_str = f"{tflops_diff_opt:+.2f}"
+            if baseline2_data and baseline2_data.get('median'):
+                speedup_b2 = b3_t / baseline2_data['median']
+                tflops_diff_b2 = baseline2_data['tflops'] - b3_tflops
+                speedup_b2_str = f"{speedup_b2:.3f}x {'↑' if speedup_b2 > 1 else '↓'}"
+                tflops_b2_str = f"{tflops_diff_b2:+.2f}"
             else:
-                speedup_opt_str = "N/A"
-                tflops_opt_str = "N/A"
+                speedup_b2_str = "N/A"
+                tflops_b2_str = "N/A"
             
-            print(f"{name:<10} | {speedup_v2_str:<18} | {speedup_opt_str:<19} | {tflops_v2_str:<18} | {tflops_opt_str}")
+            if fused_data and fused_data.get('median'):
+                speedup_fused = b3_t / fused_data['median']
+                tflops_diff_fused = fused_data['tflops'] - b3_tflops
+                speedup_fused_str = f"{speedup_fused:.3f}x {'↑' if speedup_fused > 1 else '↓'}"
+                tflops_fused_str = f"{tflops_diff_fused:+.2f}"
+            else:
+                speedup_fused_str = "N/A"
+                tflops_fused_str = "N/A"
+            
+            print(f"{name:<10} | {speedup_b1_str:<18} | {speedup_b2_str:<18} | {speedup_fused_str:<18} | {tflops_b1_str:<15} | {tflops_b2_str:<15} | {tflops_fused_str}")
     
-    print("="*100)
+    print("="*130)
 
 
 if __name__ == "__main__":
