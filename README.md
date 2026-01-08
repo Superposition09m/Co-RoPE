@@ -53,7 +53,7 @@ pip install transformers
 
 **Rotary Positional Embedding (RoPE)** encodes absolute positional information by rotating the query and key vectors in a high-dimensional space. Given a position $m$ and a vector $\mathbf{x}(\mathbf{q} \text{ or } \mathbf{k})$, the rotation is defined as:
 
-$$f(\mathbf{x}, m) = \begin{pmatrix} x_1 \\ x_2 \\ \vdots \\ x_d \end{pmatrix} \otimes \begin{pmatrix} \cos m\theta_1 \\ \cos m\theta_1 \\ \vdots \\ \cos m\theta_{d/2} \end{pmatrix} + \begin{pmatrix} -x_2 \\ x_1 \\ \vdots \\ -x_{d-1} \end{pmatrix} \otimes \begin{pmatrix} \sin m\theta_1 \\ \sin m\theta_1 \\ \vdots \\ \sin m\theta_{d/2} \end{pmatrix}$$
+$$f(\mathbf{x}, m) = \begin{pmatrix} x_1, x_2, \cdots, x_d \end{pmatrix} \otimes \begin{pmatrix} \cos m\theta_1, \cos m\theta_1, \cdots, \cos m\theta_{d/2} \end{pmatrix} + \begin{pmatrix} -x_2, x_1, \cdots, -x_{d-1} \end{pmatrix} \otimes \begin{pmatrix} \sin m\theta_1, \sin m\theta_1, \cdots, \sin m\theta_{d/2} \end{pmatrix}$$
 
 > [Note] In code implementation (like `transformers`), we often use half layout instead of interleaved layout, which is more efficient for GPU operations.
 
