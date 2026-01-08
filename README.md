@@ -51,7 +51,7 @@ pip install transformers
 
 ### Algorithm
 
-**Rotary Positional Embedding (RoPE)** encodes absolute positional information by rotating the query and key vectors in a high-dimensional space. Given a position $m$ and a vector $\mathbf{x}(\mathbf{q} \text{ or } \mathbf{k})$, the rotation is defined as:
+**Rotary Positional Embedding (RoPE)** encodes positional information by rotating the query and key vectors in a high-dimensional space. Given a position $m$ and a vector $\mathbf{x}(\mathbf{q} \text{ or } \mathbf{k})$, the rotation is defined as:
 
 $$f(\mathbf{x}, m) = \begin{pmatrix} x_1, x_2, \cdots, x_d \end{pmatrix} \otimes \begin{pmatrix} \cos m\theta_1, \cos m\theta_1, \cdots, \cos m\theta_{d/2} \end{pmatrix} + \begin{pmatrix} -x_2, x_1, \cdots, -x_{d-1} \end{pmatrix} \otimes \begin{pmatrix} \sin m\theta_1, \sin m\theta_1, \cdots, \sin m\theta_{d/2} \end{pmatrix}$$
 
@@ -107,29 +107,30 @@ for start_n in tl.range(lo, hi, BLOCK_N):
 - Ours: Fused RoPE (Triton)
 
 
-| Configuration (B, H, N, D) | Pass | Baseline 1 (PyTorch SDPA) | Baseline 2 (Official) | Baseline 3 (Triton v2) | Fused RoPE (Ours) | Speedup (vs B3) |
-|---------------------------|------|---------------------------|------------------------|------------------------|-------------------|-----------------|
-| **Small-512** (4, 8, 512, 64) | FWD | 0.12ms (18.10 TFLOPS)    | 0.14ms (15.18 TFLOPS) | 0.20ms (10.66 TFLOPS) | **0.04ms (49.91 TFLOPS)** | **4.68x ↑** |
-|                           | BWD  | 0.52ms (10.24 TFLOPS)    | 0.69ms (7.76 TFLOPS)  | 0.76ms (7.09 TFLOPS)  | **0.32ms (16.66 TFLOPS)** | **2.35x ↑** |
-| **Small-1K** (4, 8, 1024, 64) | FWD | 0.17ms (51.19 TFLOPS)    | 0.17ms (51.46 TFLOPS) | 0.21ms (41.43 TFLOPS) | **0.05ms (171.74 TFLOPS)** | **4.15x ↑** |
-|                           | BWD  | 0.71ms (30.15 TFLOPS)    | 0.80ms (26.80 TFLOPS) | 0.75ms (28.76 TFLOPS) | **0.22ms (99.75 TFLOPS)**  | **3.47x ↑** |
-| **Llama7B-2K** (2, 32, 2048, 128) | FWD | 0.81ms (170.38 TFLOPS)   | 0.79ms (174.21 TFLOPS) | 0.71ms (193.82 TFLOPS) | **0.38ms (360.47 TFLOPS)** | **1.86x ↑** |
-|                              | BWD | 1.56ms (220.89 TFLOPS)   | 1.42ms (241.44 TFLOPS) | 2.79ms (123.38 TFLOPS) | **2.88ms (119.30 TFLOPS)** | **0.97x ↓** |
-| **Llama7B-4K** (2, 32, 4096, 128) | FWD | 1.88ms (292.04 TFLOPS)   | 1.83ms (301.00 TFLOPS) | 1.59ms (344.94 TFLOPS) | **1.25ms (439.29 TFLOPS)** | **1.27x ↑** |
-|                              | BWD | 4.06ms (338.77 TFLOPS)   | 3.73ms (369.00 TFLOPS) | 8.43ms (162.96 TFLOPS) | **9.47ms (145.06 TFLOPS)** | **0.89x ↓** |
-| **Llama70B-1K** (2, 64, 1024, 128) | FWD | 0.70ms (98.93 TFLOPS)    | 0.68ms (100.55 TFLOPS) | 0.64ms (106.91 TFLOPS) | **0.22ms (312.36 TFLOPS)** | **2.92x ↑** |
-|                               | BWD | 1.25ms (137.35 TFLOPS)   | 1.14ms (151.13 TFLOPS) | 1.96ms (87.73 TFLOPS)  | **1.83ms (93.65 TFLOPS)**  | **1.07x ↑** |
-| **Long-64K** (1, 8, 65536, 128) | FWD | 27.06ms (650.07 TFLOPS)  | 25.87ms (679.92 TFLOPS) | 18.05ms (974.89 TFLOPS) | **34.80ms (505.47 TFLOPS)** | **0.52x ↓** |
-|                               | BWD | 71.04ms (619.10 TFLOPS)  | 66.68ms (659.56 TFLOPS) | 204.99ms (214.55 TFLOPS) | **254.39ms (172.89 TFLOPS)** | **0.81x ↓** |
+| Configuration (B, H, N, D) | Pass | Baseline 1 (PyTorch SDPA) | Baseline 2 (Official)      | Baseline 3 (Triton v2)      | Fused RoPE (Ours)              | Speedup (vs B3) |
+|---------------------------|------|---------------------------|----------------------------|-----------------------------|--------------------------------|-----------------|
+| **Small-512** (4, 8, 512, 64) | FWD | 0.119ms (18.10 TFLOPS)   | 0.142ms (15.18 TFLOPS)     | 0.202ms (10.66 TFLOPS)      | **0.043ms (49.91 TFLOPS)**     | **4.68x ↑** |
+|                           | BWD  | 0.524ms (10.24 TFLOPS)   | 0.692ms (7.76 TFLOPS)      | 0.757ms (7.09 TFLOPS)       | **0.322ms (16.66 TFLOPS)**     | **2.35x ↑** |
+| **Small-1K** (4, 8, 1024, 64) | FWD | 0.168ms (51.19 TFLOPS)   | 0.167ms (51.46 TFLOPS)     | 0.207ms (41.43 TFLOPS)      | **0.050ms (171.74 TFLOPS)**    | **4.15x ↑** |
+|                           | BWD  | 0.712ms (30.15 TFLOPS)   | 0.801ms (26.80 TFLOPS)     | 0.747ms (28.76 TFLOPS)      | **0.215ms (99.75 TFLOPS)**     | **3.47x ↑** |
+| **Llama7B-2K** (2, 32, 2048, 128) | FWD | 0.807ms (170.38 TFLOPS)  | 0.789ms (174.21 TFLOPS)    | 0.709ms (193.82 TFLOPS)     | **0.381ms (360.47 TFLOPS)**    | **1.86x ↑** |
+|                              | BWD | 1.556ms (220.89 TFLOPS)  | 1.423ms (241.44 TFLOPS)    | 2.785ms (123.38 TFLOPS)     | **2.880ms (119.30 TFLOPS)**    | **0.97x ↓** |
+| **Llama7B-4K** (2, 32, 4096, 128) | FWD | 1.882ms (292.04 TFLOPS)  | 1.826ms (301.00 TFLOPS)    | 1.594ms (344.94 TFLOPS)     | **1.251ms (439.29 TFLOPS)**    | **1.27x ↑** |
+|                              | BWD | 4.057ms (338.77 TFLOPS)  | 3.725ms (369.00 TFLOPS)    | 8.434ms (162.96 TFLOPS)     | **9.474ms (145.06 TFLOPS)**    | **0.89x ↓** |
+| **Llama70B-1K** (2, 64, 1024, 128) | FWD | 0.695ms (98.93 TFLOPS)   | 0.683ms (100.55 TFLOPS)    | 0.643ms (106.91 TFLOPS)     | **0.220ms (312.36 TFLOPS)**    | **2.92x ↑** |
+|                               | BWD | 1.251ms (137.35 TFLOPS)  | 1.137ms (151.13 TFLOPS)    | 1.958ms (87.73 TFLOPS)      | **1.834ms (93.65 TFLOPS)**     | **1.07x ↑** |
+| **Long-64K** (1, 8, 65536, 128) | FWD | 27.062ms (650.07 TFLOPS) | 25.874ms (679.92 TFLOPS)   | 18.045ms (974.89 TFLOPS)    | **34.804ms (505.47 TFLOPS)**   | **0.52x ↓** |
+|                               | BWD | 71.039ms (619.10 TFLOPS) | 66.682ms (659.56 TFLOPS)   | 204.990ms (214.55 TFLOPS)   | **254.385ms (172.89 TFLOPS)**  | **0.81x ↓** |
 
 **Conclusion**
-- **Fusion Dominates Short Sequences**: Achieves 2.9x – 4.6x speedup for N≤1024 by eliminating separate kernel launches and redundant DRAM I/O for Query/Key tensors.
+- **IO-Bound Regime (N ≤ 1024)**: Our Fused RoPE achieves a significant 2.9x – 4.6x speedup. In this regime, the kernel is limited by HBM bandwidth and kernel launch latency. By fusing the rotary transformation into the SRAM-resident tiles of Flash Attention, we eliminate the redundant R/W cycles of $Q_{rope}$ and $K_{rope}$ to global memory.
 
-- **Compute-Bound Inflection**: Beyond 4K length, speedup diminishes as the bottleneck shifts from Memory I/O to Compute. High Register Pressure from fused RoPE logic causes performance regression in ultra-long sequences (64K+).
+- **Compute-Bound Transition (N ≥ 4096)**: As sequence length increases, the attention mechanism transitions from being memory-bound to compute-bound. 
 
-- **Triton Autotune Advantage**: Baseline 3 (Triton) significantly outperforms Baseline 2 (Official CUDA) at 64K length, nearing 1 PFLOPS. This proves Triton's autotuning is superior to static CUDA heuristics for long-context workloads on H200.
+- **Register Pressure and Long-Context (64K)**: In ultra-long sequences ($N=64K$), our fused implementation exhibits a performance regression (0.52x vs. B3).
+    - **Root Cause**: The addition of RoPE logic increases the Register Pressure per thread. To accommodate the rotary state, the Triton compiler may reduce the Occupancy or trigger Register Spilling, which is particularly costly in the massive loops of long-context attention.
 
-- **BWD Efficiency**: Gains are consistent but lower than FWD (max 3.47x) due to higher inherent compute intensity in the backward pass.
+- **Backward Pass Asymmetry**: The speedup in BWD is consistently lower than FWD (max 3.47x). This is expected as the BWD pass of Flash Attention is inherently more compute-intensive (calculating gradients for $Q, K, V$), making the relative savings from memory fusion less impactful.
 
 ## Co-RoPE (Experimental)
 Co-RoPE is a context-aware improvement of RoPE.
@@ -198,6 +199,9 @@ We use a leader head to compute the contextual mileage and the accumulated milea
 
 ### Bottleneck Analysis
 
-This is a mathematically elegant but computationally expensive implementation. The context-aware mileage computation has $O(N^2)$ complexity, which becomes the primary bottleneck for long sequences.
+This is a mathematically elegant but computationally expensive implementation. The context-aware mileage computation has $O(N^2)$ complexity, which becomes the primary bottleneck for long sequences. This is a runnable version but has not been fully optimized, and fully optimizing it also isn't worth the cost.
 
-Even with an efficient rotation implementation, the 3D phase angle tensor introduces significant memory and computational overhead, posing challenges for Triton compiler optimization. This is a runnable version but has not been fully optimized.
+Even with an efficient rotation implementation, the 3D phase(because each D/2 feature is non-linear and has to be computed for each position) angle tensor introduces significant memory and computational overhead, posing challenges for Triton compiler optimization. 
+
+The Trigonometric Disaster in Inner Loops is obvious. Pushing trigonometric computations (sin/cos) into the most nested loop of a Triton kernel is, frankly, a performance nightmare.
+
